@@ -12,22 +12,26 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================
 
-# Load Slack token from environment
-SLACK_TOKEN = os.environ.get("SLACK_TOKEN")
-if not SLACK_TOKEN:
+# User token (used by slash command)
+USER_TOKEN = os.environ.get("SLACK_TOKEN")
+if not USER_TOKEN:
     raise ValueError("SLACK_TOKEN environment variable not set!")
 
-client = WebClient(token=SLACK_TOKEN)
+user_client = WebClient(token=USER_TOKEN)
+
+# Bot token (used by Home tab button)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable not set!")
+
+bot_client = WebClient(token=BOT_TOKEN)
 
 # Load CSV once at startup
 CSV_PATH = "workspace_users.csv"
 if not os.path.exists(CSV_PATH):
     raise FileNotFoundError(f"{CSV_PATH} not found. Make sure your CSV is uploaded.")
 
-try:
-    startups = pd.read_csv(CSV_PATH)
-except Exception as e:
-    raise Exception(f"Failed to read CSV: {e}")
+startups = pd.read_csv(CSV_PATH)
 
 # Ensure required columns exist
 required_columns = {"startup_name", "founder_name", "slack_user_id"}
@@ -44,8 +48,13 @@ MESSAGE_TEMPLATE = (
 # CORE MESSAGE PROCESSING
 # =========================
 
-def process_messages(user_id):
+def process_messages(user_id, client_type="user"):
     total_sent = 0
+
+    client = user_client if client_type == "user" else bot_client
+    source = "USER" if client_type == "user" else "BOT"
+
+    print(f"[DEBUG] Starting to send messages as {source}")
 
     for _, row in startups.iterrows():
         slack_id = row.get("slack_user_id")
@@ -60,19 +69,18 @@ def process_messages(user_id):
         try:
             client.chat_postMessage(channel=slack_id, text=message)
             total_sent += 1
-            time.sleep(1)  # rate limit safety
+            time.sleep(1)
         except Exception as e:
             print(f"❌ Failed to send to {slack_id}: {e}")
 
-    # Notify the admin when done
+    # Notify the user/admin when done
     try:
         client.chat_postMessage(
             channel=user_id,
-            text=f"✅ Finished sending {total_sent} messages."
+            text=f"✅ Finished sending {total_sent} messages as {source}."
         )
     except Exception as e:
-        print(f"❌ Could not notify admin: {e}")
-
+        print(f"❌ Could not notify {source}: {e}")
 
 # =========================
 # ROOT / HEALTH CHECK
@@ -82,9 +90,8 @@ def process_messages(user_id):
 def home():
     return "✅ Slack bot is running! Use /sendmessages or open the Home tab."
 
-
 # =========================
-# SLASH COMMAND
+# SLASH COMMAND (user messages)
 # =========================
 
 @app.route("/sendmessages", methods=["POST"])
@@ -96,12 +103,11 @@ def send_messages():
         "text": "✅ Slack acknowledged! Sending messages now..."
     }
 
-    # Run in background thread
-    thread = threading.Thread(target=process_messages, args=(user_id,))
+    # Send messages as the user
+    thread = threading.Thread(target=process_messages, args=(user_id, "user"))
     thread.start()
 
     return jsonify(response), 200
-
 
 # =========================
 # SLACK EVENTS (HOME TAB + URL VERIFICATION)
@@ -111,49 +117,35 @@ def send_messages():
 def slack_events():
     data = request.json
 
-    # 1️⃣ URL verification
+    # URL verification
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
-    # 2️⃣ Home tab opened
+    # Home tab opened
     if data.get("event", {}).get("type") == "app_home_opened":
         user_id = data["event"]["user"]
 
-        client.views_publish(
-            user_id=user_id,
-            view={
-                "type": "home",
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn", "text": "*🚀 SendMessagesBot Dashboard*"}
-                    },
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "Click the button below to send messages to all startups."
-                        }
-                    },
-                    {
-                        "type": "actions",
-                        "elements": [
-                            {
-                                "type": "button",
-                                "text": {"type": "plain_text", "text": "🚀 Send Messages"},
-                                "action_id": "send_messages_button"
-                            }
-                        ]
-                    }
-                ]
-            }
-        )
+        try:
+            bot_client.views_publish(
+                user_id=user_id,
+                view={
+                    "type": "home",
+                    "blocks": [
+                        {"type": "section", "text": {"type": "mrkdwn", "text": "*🚀 SendMessagesBot Dashboard*"}},
+                        {"type": "section", "text": {"type": "mrkdwn", "text": "Click the button below to send messages to all startups as BOT."}},
+                        {"type": "actions", "elements": [
+                            {"type": "button", "text": {"type": "plain_text", "text": "🚀 Send Messages"}, "action_id": "send_messages_button"}
+                        ]}
+                    ]
+                }
+            )
+        except Exception as e:
+            print(f"❌ Failed to publish Home tab: {e}")
 
     return "", 200
 
-
 # =========================
-# BUTTON INTERACTIONS
+# BUTTON INTERACTIONS (bot messages)
 # =========================
 
 @app.route("/slack/interactions", methods=["POST"])
@@ -165,11 +157,10 @@ def slack_interactions():
         user_id = payload["user"]["id"]
 
         if action_id == "send_messages_button":
-            thread = threading.Thread(target=process_messages, args=(user_id,))
+            thread = threading.Thread(target=process_messages, args=(user_id, "bot"))
             thread.start()
 
     return "", 200
-
 
 # =========================
 # RUN APP
