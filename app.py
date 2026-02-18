@@ -3,8 +3,7 @@ from slack_sdk import WebClient
 import pandas as pd
 import os
 import time
-import queue
-import threading
+import requests
 
 app = Flask(__name__)
 
@@ -36,29 +35,6 @@ MESSAGE_TEMPLATE = (
     "e queria compartilhar algo com você!"
 )
 
-# Thread-safe queue for messages
-message_queue = queue.Queue()
-
-def worker():
-    """Worker thread to send Slack messages one by one."""
-    while True:
-        slack_id, message = message_queue.get()
-        try:
-            client.chat_postMessage(channel=slack_id, text=message)
-            print(f"✅ Message sent to {slack_id}")
-        except Exception as e:
-            print(f"❌ Failed to send to {slack_id}: {e}")
-        time.sleep(1)  # Slack rate limit
-        message_queue.task_done()
-
-# Start workers once per Gunicorn worker
-@app.before_first_request
-def start_workers():
-    for _ in range(3):  # number of threads
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-    print("🟢 Slack message worker threads started!")
-
 @app.route("/")
 def home():
     return "✅ Slack bot is running! Use /sendmessages in Slack."
@@ -66,35 +42,52 @@ def home():
 @app.route("/sendmessages", methods=["POST"])
 def send_messages():
     """
-    Triggered by Slack slash command.
-    Queues messages in the background.
+    Slack slash command handler.
+    Uses response_url to avoid timeout.
     """
-    channel_id = request.form.get("channel_id")
 
-    # Immediate response to Slack
-    if channel_id:
-        try:
-            client.chat_postMessage(
-                channel=channel_id,
-                text="✅ Slack acknowledged! Messages are being queued in the background..."
-            )
-        except Exception as e:
-            print(f"❌ Failed to notify Slack user: {e}")
+    response_url = request.form.get("response_url")
 
-    # Queue messages for all founders
+    # 1️⃣ Immediate response (Slack requires <3s)
+    immediate_response = {
+        "response_type": "ephemeral",
+        "text": "✅ Slack acknowledged! Sending messages now..."
+    }
+
+    # Send immediate acknowledgement
+    requests.post(response_url, json=immediate_response)
+
+    total_sent = 0
+
+    # 2️⃣ Process CSV synchronously
     for _, row in startups.iterrows():
         slack_id = row.get("slack_user_id")
+
         if pd.isna(slack_id) or not slack_id:
-            print(f"⚠️ Missing Slack ID for {row.get('founder_name', 'Unknown')}")
             continue
 
         message = MESSAGE_TEMPLATE.format(
             founder_name=row.get("founder_name", "Founder"),
             startup_name=row.get("startup_name", "Startup")
         )
-        message_queue.put((slack_id, message))
 
-    return jsonify({"text": "✅ Messages are queued and being sent in the background!"})
+        try:
+            client.chat_postMessage(channel=slack_id, text=message)
+            total_sent += 1
+            time.sleep(1)  # Slack rate limit
+        except Exception as e:
+            print(f"❌ Failed to send to {slack_id}: {e}")
+
+    # 3️⃣ Final completion message
+    final_response = {
+        "response_type": "ephemeral",
+        "text": f"✅ Finished sending {total_sent} messages."
+    }
+
+    requests.post(response_url, json=final_response)
+
+    return "", 200
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))

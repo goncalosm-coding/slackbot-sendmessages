@@ -2,3 +2,4 @@ Flask
 slack_sdk
 pandas
 gunicorn
+requests
