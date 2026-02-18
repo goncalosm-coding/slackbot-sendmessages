@@ -15,7 +15,6 @@ client = WebClient(token=SLACK_TOKEN)
 
 # Load CSV once at startup
 CSV_PATH = "workspace_users.csv"
-
 if not os.path.exists(CSV_PATH):
     raise FileNotFoundError(f"{CSV_PATH} not found. Make sure your CSV is uploaded.")
 
@@ -24,55 +23,61 @@ try:
 except Exception as e:
     raise Exception(f"Failed to read CSV: {e}")
 
-# Check required columns
+# Ensure required columns exist
 required_columns = {"startup_name", "founder_name", "slack_user_id"}
 missing_columns = required_columns - set(startups.columns)
 if missing_columns:
     raise Exception(f"CSV is missing required columns: {missing_columns}")
 
-MESSAGE_TEMPLATE = "Olá {founder_name}, tenho acompanhado a {startup_name} e queria compartilhar algo com você!"
+MESSAGE_TEMPLATE = (
+    "Olá {founder_name}, tenho acompanhado a {startup_name} "
+    "e queria compartilhar algo com você!"
+)
 
-# Simple route for browser check
 @app.route("/")
 def home():
     return "✅ Slack bot is running! Use /sendmessages in Slack."
 
-# Slash command endpoint
 @app.route("/sendmessages", methods=["POST"])
 def send_messages():
-    data = request.form
-    user_id = data.get("user_id")
-    channel_id = data.get("channel_id")
+    """
+    Triggered by the Slack slash command.
+    Sends messages to all founders listed in the CSV.
+    """
+    # Immediately acknowledge Slack to avoid timeout
+    channel_id = request.form.get("channel_id")
+    if channel_id:
+        try:
+            client.chat_postMessage(
+                channel=channel_id, text="✅ Mensagens estão sendo enviadas em segundo plano..."
+            )
+        except Exception as e:
+            print(f"❌ Failed to notify user: {e}")
 
-    # Notify user
-    try:
-        client.chat_postMessage(channel=channel_id, text=f"✅ Enviando mensagens...")
-    except Exception as e:
-        print(f"❌ Failed to notify user: {e}")
-
-    # Send messages to each startup founder
     results = []
+
+    # Iterate founders and send messages
     for _, row in startups.iterrows():
-        slack_id = row.get('slack_user_id')
+        slack_id = row.get("slack_user_id")
         if pd.isna(slack_id) or not slack_id:
-            results.append(f"⚠️ Missing Slack ID for {row['founder_name']}")
+            results.append(f"⚠️ Missing Slack ID for {row.get('founder_name', 'Unknown')}")
             continue
 
         message = MESSAGE_TEMPLATE.format(
-            founder_name=row['founder_name'],
-            startup_name=row['startup_name']
+            founder_name=row.get("founder_name", "Founders"),
+            startup_name=row.get("startup_name", "Startup")
         )
 
         try:
             client.chat_postMessage(channel=slack_id, text=message)
-            time.sleep(1)  # avoid rate limits
-            results.append(f"✅ Message sent to {row['founder_name']}")
+            results.append(f"✅ Message sent to {row.get('founder_name', 'Unknown')}")
+            time.sleep(1)  # avoid Slack rate limits
         except Exception as e:
-            error_msg = f"❌ Failed to send to {row['founder_name']}: {e}"
+            error_msg = f"❌ Failed to send to {row.get('founder_name', 'Unknown')}: {e}"
             print(error_msg)
             results.append(error_msg)
 
-    return jsonify({"results": results, "text": "✅ Todas as mensagens processadas!"})
+    return jsonify({"text": "✅ Todas as mensagens processadas!", "results": results})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
