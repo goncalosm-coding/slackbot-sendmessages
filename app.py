@@ -12,28 +12,27 @@ app = Flask(__name__)
 # CONFIGURATION
 # =========================
 
-# User token (used by slash command)
-USER_TOKEN = os.environ.get("SLACK_TOKEN")
+# Slack tokens
+USER_TOKEN = os.environ.get("SLACK_TOKEN")  # user token
 if not USER_TOKEN:
     raise ValueError("SLACK_TOKEN environment variable not set!")
 
-user_client = WebClient(token=USER_TOKEN)
-
-# Bot token (used by Home tab button)
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # bot token
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set!")
 
+user_client = WebClient(token=USER_TOKEN)
 bot_client = WebClient(token=BOT_TOKEN)
 
-# Load CSV once at startup
+# Admin Slack user ID (only this user can send messages)
+ADMIN_USER_ID = "U0AFL5S3R0A"  # <--- replace with actual admin user ID
+
+# Load CSV once
 CSV_PATH = "workspace_users.csv"
 if not os.path.exists(CSV_PATH):
     raise FileNotFoundError(f"{CSV_PATH} not found. Make sure your CSV is uploaded.")
 
 startups = pd.read_csv(CSV_PATH)
-
-# Ensure required columns exist
 required_columns = {"startup_name", "founder_name", "slack_user_id"}
 missing_columns = required_columns - set(startups.columns)
 if missing_columns:
@@ -49,12 +48,15 @@ MESSAGE_TEMPLATE = (
 # =========================
 
 def process_messages(user_id, client_type="user"):
-    total_sent = 0
+    if user_id != ADMIN_USER_ID:
+        print(f"❌ User {user_id} is not allowed to send messages.")
+        return
 
+    total_sent = 0
     client = user_client if client_type == "user" else bot_client
     source = "USER" if client_type == "user" else "BOT"
 
-    print(f"[DEBUG] Starting to send messages as {source}")
+    print(f"[DEBUG] Sending messages as {source}")
 
     for _, row in startups.iterrows():
         slack_id = row.get("slack_user_id")
@@ -73,7 +75,7 @@ def process_messages(user_id, client_type="user"):
         except Exception as e:
             print(f"❌ Failed to send to {slack_id}: {e}")
 
-    # Notify the user/admin when done
+    # Notify admin when done
     try:
         client.chat_postMessage(
             channel=user_id,
@@ -98,12 +100,18 @@ def home():
 def send_messages():
     user_id = request.form.get("user_id")
 
+    if user_id != ADMIN_USER_ID:
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": "❌ You are not allowed to use this command."
+        }), 200
+
     response = {
         "response_type": "ephemeral",
         "text": "✅ Slack acknowledged! Sending messages now..."
     }
 
-    # Send messages as the user
+    # Send messages as the admin user
     thread = threading.Thread(target=process_messages, args=(user_id, "user"))
     thread.start()
 
@@ -126,19 +134,32 @@ def slack_events():
         user_id = data["event"]["user"]
 
         try:
-            bot_client.views_publish(
-                user_id=user_id,
-                view={
-                    "type": "home",
-                    "blocks": [
-                        {"type": "section", "text": {"type": "mrkdwn", "text": "*🚀 SendMessagesBot Dashboard*"}},
-                        {"type": "section", "text": {"type": "mrkdwn", "text": "Click the button below to send messages to all startups as BOT."}},
-                        {"type": "actions", "elements": [
-                            {"type": "button", "text": {"type": "plain_text", "text": "🚀 Send Messages"}, "action_id": "send_messages_button"}
-                        ]}
-                    ]
-                }
-            )
+            if user_id == ADMIN_USER_ID:
+                # Admin sees interactive button
+                bot_client.views_publish(
+                    user_id=user_id,
+                    view={
+                        "type": "home",
+                        "blocks": [
+                            {"type": "section", "text": {"type": "mrkdwn", "text": "*🚀 SendMessagesBot Dashboard*"}},
+                            {"type": "section", "text": {"type": "mrkdwn", "text": "Click the button below to send messages to all startups as BOT."}},
+                            {"type": "actions", "elements": [
+                                {"type": "button", "text": {"type": "plain_text", "text": "🚀 Send Messages"}, "action_id": "send_messages_button"}
+                            ]}
+                        ]
+                    }
+                )
+            else:
+                # Regular users see info only
+                bot_client.views_publish(
+                    user_id=user_id,
+                    view={
+                        "type": "home",
+                        "blocks": [
+                            {"type": "section", "text": {"type": "mrkdwn", "text": "👋 Hi! Only the admin can send messages."}}
+                        ]
+                    }
+                )
         except Exception as e:
             print(f"❌ Failed to publish Home tab: {e}")
 
@@ -151,14 +172,16 @@ def slack_events():
 @app.route("/slack/interactions", methods=["POST"])
 def slack_interactions():
     payload = json.loads(request.form["payload"])
+    action_id = payload["actions"][0]["action_id"]
+    user_id = payload["user"]["id"]
 
-    if payload["type"] == "block_actions":
-        action_id = payload["actions"][0]["action_id"]
-        user_id = payload["user"]["id"]
+    if action_id == "send_messages_button":
+        if user_id != ADMIN_USER_ID:
+            print(f"❌ User {user_id} tried to use the button without permission.")
+            return "", 200
 
-        if action_id == "send_messages_button":
-            thread = threading.Thread(target=process_messages, args=(user_id, "bot"))
-            thread.start()
+        thread = threading.Thread(target=process_messages, args=(user_id, "bot"))
+        thread.start()
 
     return "", 200
 
