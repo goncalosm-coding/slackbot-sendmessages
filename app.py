@@ -95,7 +95,7 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
 
 @app.route("/")
 def home():
-    return "Slack bot is running."
+    return "UnicornFactory bot is running."
 
 # =========================
 # SLASH COMMAND
@@ -124,11 +124,11 @@ def send_messages():
 
     return jsonify({
         "response_type": "ephemeral",
-        "text": "Sending messages now. You'll receive a DM when it's done."
+        "text": "Blasting messages now. Check your DMs for a confirmation when it's done."
     }), 200
 
 # =========================
-# HOME TAB VIEW
+# HOME TAB VIEWS
 # =========================
 
 def build_admin_home_view():
@@ -136,6 +136,7 @@ def build_admin_home_view():
     selected_ids = admin_session["selected_startup_ids"]
     current_template = admin_session["message_template"]
     selected_count = startup_count if selected_ids is None else len(selected_ids)
+    skipped_count = startup_count - selected_count
 
     startup_options = []
     initial_options = []
@@ -154,37 +155,62 @@ def build_admin_home_view():
         "type": "home",
         "blocks": [
 
-            # ── HERO ───────────────────────────────────────────────────
+            # ── BRAND HEADER ───────────────────────────────────────────
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "UnicornFactory",
+                    "emoji": False
+                }
+            },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        "*SendMessagesBot*\n"
-                        "Outreach dashboard — send personalized messages to your founders at scale."
-                    )
+                    "text": "Outreach that hits different. Select your founders, craft your message, blast it out."
                 }
             },
             {"type": "divider"},
 
-            # ── LIVE STATS ─────────────────────────────────────────────
+            # ── STATS BAND ─────────────────────────────────────────────
             {
                 "type": "section",
                 "fields": [
-                    {"type": "mrkdwn", "text": f"*Total founders*\n{startup_count}"},
-                    {"type": "mrkdwn", "text": f"*Currently selected*\n{selected_count}"},
-                    {"type": "mrkdwn", "text": "*Access level*\nAdmin"},
-                    {"type": "mrkdwn", "text": "*Trigger*\nHome tab  ·  `/sendmessages`"}
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*{startup_count}*\nFounders in the roster"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*{selected_count}*\nSelected to receive"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*{skipped_count}*\nSkipped this round"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": "*Admin*\nFull access"
+                    }
                 ]
             },
             {"type": "divider"},
 
-            # ── RECIPIENT SELECTOR ─────────────────────────────────────
+            # ── RECIPIENTS ─────────────────────────────────────────────
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Who's getting this?",
+                    "emoji": False
+                }
+            },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*Recipients*\nChoose which founders will receive the message. Deselect any you want to skip."
+                    "text": "Uncheck anyone you want to skip. Everyone else gets the message."
                 }
             },
             {
@@ -202,22 +228,24 @@ def build_admin_home_view():
 
             # ── MESSAGE PREVIEW ────────────────────────────────────────
             {
-                "type": "section",
+                "type": "header",
                 "text": {
-                    "type": "mrkdwn",
-                    "text": "*Message template*"
+                    "type": "plain_text",
+                    "text": "The message",
+                    "emoji": False
                 }
             },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f">{current_template}"
+                    "text": f"_{current_template}_"
                 },
                 "accessory": {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "Edit message", "emoji": False},
-                    "action_id": "open_message_editor"
+                    "text": {"type": "plain_text", "text": "Edit", "emoji": False},
+                    "action_id": "open_message_editor",
+                    "style": "primary"
                 }
             },
             {
@@ -225,20 +253,32 @@ def build_admin_home_view():
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": "*Preview:*  " + current_template.format(
-                            founder_name="Maria", startup_name="Acme"
+                        "text": (
+                            "Live preview  —  "
+                            + current_template.format(founder_name="Maria", startup_name="Acme")
                         )
                     }
                 ]
             },
             {"type": "divider"},
 
-            # ── SEND BUTTON ────────────────────────────────────────────
+            # ── LAUNCH ─────────────────────────────────────────────────
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Ready to launch?",
+                    "emoji": False
+                }
+            },
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*Ready to send?*\nThis will dispatch your message to *{selected_count} founder(s)*. You'll get a DM confirmation when it completes."
+                    "text": (
+                        f"You're about to reach *{selected_count} founder(s)*. "
+                        f"You'll get a DM the moment it's done."
+                    )
                 }
             },
             {
@@ -250,19 +290,31 @@ def build_admin_home_view():
                         "style": "primary",
                         "action_id": "send_messages_button",
                         "confirm": {
-                            "title": {"type": "plain_text", "text": "Are you sure?"},
+                            "title": {"type": "plain_text", "text": "Launch outreach?"},
                             "text": {
                                 "type": "mrkdwn",
-                                "text": f"This will send a message to *{selected_count} founder(s)*. This cannot be undone."
+                                "text": (
+                                    f"This sends your message to *{selected_count} founder(s)* right now. "
+                                    f"No take-backs."
+                                )
                             },
-                            "confirm": {"type": "plain_text", "text": "Yes, send"},
-                            "deny": {"type": "plain_text", "text": "Cancel"}
+                            "confirm": {"type": "plain_text", "text": "Let's go"},
+                            "deny": {"type": "plain_text", "text": "Not yet"}
                         }
                     },
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "Reset to defaults", "emoji": False},
+                        "text": {"type": "plain_text", "text": "Reset everything", "emoji": False},
                         "action_id": "reset_defaults_button"
+                    }
+                ]
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "You can also trigger a send via `/sendmessages` from any channel."
                     }
                 ]
             }
@@ -282,9 +334,14 @@ def build_message_editor_modal():
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "Use `{founder_name}` and `{startup_name}` as placeholders."
+                    "text": (
+                        "*Make it yours.*\n"
+                        "Use `{founder_name}` and `{startup_name}` as dynamic placeholders — "
+                        "they'll be swapped out for each founder automatically."
+                    )
                 }
             },
+            {"type": "divider"},
             {
                 "type": "input",
                 "block_id": "message_editor_block",
@@ -295,10 +352,15 @@ def build_message_editor_modal():
                     "initial_value": admin_session["message_template"],
                     "placeholder": {
                         "type": "plain_text",
-                        "text": "Write your message here..."
+                        "text": "Write something worth reading..."
                     }
                 },
-                "label": {"type": "plain_text", "text": "Message body", "emoji": False}
+                "label": {"type": "plain_text", "text": "Message body", "emoji": False},
+                "hint": {
+                    "type": "plain_text",
+                    "text": "Click Save when you're happy with it. The Home tab will update with a live preview.",
+                    "emoji": False
+                }
             }
         ]
     }
@@ -309,10 +371,18 @@ def build_guest_home_view():
         "type": "home",
         "blocks": [
             {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "UnicornFactory",
+                    "emoji": False
+                }
+            },
+            {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*SendMessagesBot*\nPersonalized outreach, delivered to every founder in your workspace."
+                    "text": "Outreach that hits different."
                 }
             },
             {"type": "divider"},
@@ -320,13 +390,16 @@ def build_guest_home_view():
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "*Access restricted*\nThis dashboard is available to workspace admins only.\nIf you believe you should have access, reach out to your admin."
+                    "text": "*This area is admin-only.*\nYou don't have access to the outreach dashboard. If you think that's a mistake, ping your admin."
                 }
             },
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": "SendMessagesBot  ·  Admin-only outreach tool"}
+                    {
+                        "type": "mrkdwn",
+                        "text": "UnicornFactory Outreach Bot  ·  Admin access required"
+                    }
                 ]
             }
         ]
@@ -366,7 +439,7 @@ def slack_interactions():
     if user_id != ADMIN_USER_ID:
         return "", 200
 
-    # ── Modal submitted (Save button clicked) ──────────────────────────
+    # ── Modal submitted ────────────────────────────────────────────────
     if payload_type == "view_submission":
         if payload["view"]["callback_id"] == "message_editor_modal":
             new_text = (
@@ -384,7 +457,6 @@ def slack_interactions():
                 admin_session["message_template"] = new_text
                 print(f"[DEBUG] Message saved: {new_text}")
 
-            # Refresh Home tab in background — must return immediately first
             def refresh_home():
                 try:
                     bot_client.views_publish(
@@ -395,8 +467,6 @@ def slack_interactions():
                     print(f"Failed to refresh Home tab: {e}")
 
             threading.Thread(target=refresh_home).start()
-
-            # Return immediately to close the modal with no errors
             return "", 200
 
     # ── Block actions ──────────────────────────────────────────────────
@@ -407,7 +477,7 @@ def slack_interactions():
 
         action_id = actions[0]["action_id"]
 
-        # ── Open message editor modal — must return IMMEDIATELY ────────
+        # ── Open modal — return immediately ────────────────────────────
         if action_id == "open_message_editor":
             try:
                 bot_client.views_open(
@@ -416,10 +486,9 @@ def slack_interactions():
                 )
             except Exception as e:
                 print(f"Failed to open modal: {e}")
-            # Return immediately — trigger_id expires in 3 seconds
             return "", 200
 
-        # ── Startup selector changed ───────────────────────────────────
+        # ── Startup selector ───────────────────────────────────────────
         if action_id == "startup_selector":
             selected = actions[0].get("selected_options", [])
             admin_session["selected_startup_ids"] = (
@@ -443,7 +512,7 @@ def slack_interactions():
             admin_session["selected_startup_ids"] = None
             admin_session["message_template"] = DEFAULT_MESSAGE_TEMPLATE
 
-        # Refresh Home tab for all actions except modal open (handled above)
+        # Refresh Home tab
         try:
             bot_client.views_publish(
                 user_id=user_id,
