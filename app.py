@@ -3,6 +3,7 @@ from slack_sdk import WebClient
 import pandas as pd
 import os
 import time
+import threading
 
 app = Flask(__name__)
 
@@ -38,14 +39,35 @@ MESSAGE_TEMPLATE = (
 def home():
     return "✅ Slack bot is running! Use /sendmessages in Slack."
 
+def send_messages_background():
+    """Send messages to all founders in the CSV, one by one."""
+    for _, row in startups.iterrows():
+        slack_id = row.get("slack_user_id")
+        if pd.isna(slack_id) or not slack_id:
+            print(f"⚠️ Missing Slack ID for {row.get('founder_name', 'Unknown')}")
+            continue
+
+        message = MESSAGE_TEMPLATE.format(
+            founder_name=row.get("founder_name", "Founder"),
+            startup_name=row.get("startup_name", "Startup")
+        )
+
+        try:
+            client.chat_postMessage(channel=slack_id, text=message)
+            print(f"✅ Message sent to {row.get('founder_name', 'Unknown')}")
+            time.sleep(1)  # avoid Slack rate limits
+        except Exception as e:
+            print(f"❌ Failed to send to {row.get('founder_name', 'Unknown')}: {e}")
+
 @app.route("/sendmessages", methods=["POST"])
 def send_messages():
     """
     Triggered by the Slack slash command.
-    Sends messages to all founders listed in the CSV.
+    Responds immediately to avoid timeout, then sends messages in the background.
     """
-    # Immediately acknowledge Slack to avoid timeout
     channel_id = request.form.get("channel_id")
+
+    # Respond immediately to Slack
     if channel_id:
         try:
             client.chat_postMessage(
@@ -54,30 +76,11 @@ def send_messages():
         except Exception as e:
             print(f"❌ Failed to notify user: {e}")
 
-    results = []
+    # Start background thread to send messages
+    threading.Thread(target=send_messages_background, daemon=True).start()
 
-    # Iterate founders and send messages
-    for _, row in startups.iterrows():
-        slack_id = row.get("slack_user_id")
-        if pd.isna(slack_id) or not slack_id:
-            results.append(f"⚠️ Missing Slack ID for {row.get('founder_name', 'Unknown')}")
-            continue
-
-        message = MESSAGE_TEMPLATE.format(
-            founder_name=row.get("founder_name", "Founders"),
-            startup_name=row.get("startup_name", "Startup")
-        )
-
-        try:
-            client.chat_postMessage(channel=slack_id, text=message)
-            results.append(f"✅ Message sent to {row.get('founder_name', 'Unknown')}")
-            time.sleep(1)  # avoid Slack rate limits
-        except Exception as e:
-            error_msg = f"❌ Failed to send to {row.get('founder_name', 'Unknown')}: {e}"
-            print(error_msg)
-            results.append(error_msg)
-
-    return jsonify({"text": "✅ Todas as mensagens processadas!", "results": results})
+    # Immediate response to Slack to prevent operation_timeout
+    return jsonify({"text": "✅ Slack acknowledged! Messages are being sent..."})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
