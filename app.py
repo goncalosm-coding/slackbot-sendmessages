@@ -5,7 +5,6 @@ import os
 import time
 import threading
 import json
-import datetime
 
 app = Flask(__name__)
 
@@ -43,29 +42,30 @@ DEFAULT_MESSAGE_TEMPLATE = (
 
 admin_session = {
     "selected_startup_ids": None,
-    "message_template": DEFAULT_MESSAGE_TEMPLATE,
-    "scheduled_time": None,        # datetime object or None (= send immediately)
-    "scheduled_timer": None        # threading.Timer handle so we can cancel
+    "message_template": DEFAULT_MESSAGE_TEMPLATE
 }
 
 # =========================
 # CORE MESSAGE PROCESSING
 # =========================
 
-def process_messages(user_id, client_type="bot", selected_ids=None, message_template=None):
+def process_messages(user_id, client_type="user", selected_ids=None, message_template=None):
     if user_id != ADMIN_USER_ID:
+        print(f"User {user_id} is not allowed to send messages.")
         return
 
     total_sent = 0
-    client = bot_client if client_type == "bot" else user_client
+    client = user_client if client_type == "user" else bot_client
+    source = "USER" if client_type == "user" else "BOT"
     template = message_template or DEFAULT_MESSAGE_TEMPLATE
 
-    print(f"[DEBUG] Sending with template: {template}")
+    print(f"[DEBUG] Sending as {source} with template: {template}")
 
     for _, row in startups.iterrows():
         slack_id = str(row.get("slack_user_id", ""))
         if not slack_id or slack_id == "nan":
             continue
+
         if selected_ids is not None and slack_id not in selected_ids:
             continue
 
@@ -81,73 +81,13 @@ def process_messages(user_id, client_type="bot", selected_ids=None, message_temp
         except Exception as e:
             print(f"Failed to send to {slack_id}: {e}")
 
-    # Clear scheduled state after send
-    admin_session["scheduled_time"] = None
-    admin_session["scheduled_timer"] = None
-
-    # Notify admin via colored attachment
     try:
-        bot_client.chat_postMessage(
+        client.chat_postMessage(
             channel=user_id,
-            text=f"Outreach complete — {total_sent} messages sent.",
-            attachments=[
-                {
-                    "color": "#7C3AED",
-                    "blocks": [
-                        {
-                            "type": "section",
-                            "fields": [
-                                {"type": "mrkdwn", "text": f"*Messages sent*\n{total_sent}"},
-                                {"type": "mrkdwn", "text": f"*Sent at*\n{datetime.datetime.now().strftime('%d %b %Y, %H:%M')}"},
-                            ]
-                        },
-                        {
-                            "type": "context",
-                            "elements": [
-                                {"type": "mrkdwn", "text": f"Template used: _{template}_"}
-                            ]
-                        }
-                    ]
-                }
-            ]
+            text=f"Done! Sent {total_sent} messages as {source}."
         )
     except Exception as e:
         print(f"Could not notify admin: {e}")
-
-    # Refresh Home tab after send completes
-    try:
-        bot_client.views_publish(
-            user_id=user_id,
-            view=build_admin_home_view()
-        )
-    except Exception as e:
-        print(f"Could not refresh Home tab post-send: {e}")
-
-
-def schedule_messages(user_id, selected_ids, message_template, scheduled_time):
-    """Schedule a send at a specific datetime, cancelling any previous timer."""
-    # Cancel existing timer if any
-    if admin_session["scheduled_timer"] is not None:
-        admin_session["scheduled_timer"].cancel()
-        admin_session["scheduled_timer"] = None
-
-    delay = (scheduled_time - datetime.datetime.now()).total_seconds()
-    if delay <= 0:
-        # Time already passed — send immediately
-        threading.Thread(
-            target=process_messages,
-            args=(user_id, "bot", selected_ids, message_template)
-        ).start()
-        return
-
-    def run():
-        process_messages(user_id, "bot", selected_ids, message_template)
-
-    timer = threading.Timer(delay, run)
-    timer.daemon = True
-    timer.start()
-    admin_session["scheduled_timer"] = timer
-    print(f"[DEBUG] Scheduled send at {scheduled_time} (in {delay:.0f}s)")
 
 # =========================
 # ROOT / HEALTH CHECK
@@ -171,15 +111,16 @@ def send_messages():
             "text": "You are not allowed to use this command."
         }), 200
 
-    threading.Thread(
+    thread = threading.Thread(
         target=process_messages,
         args=(
             user_id,
-            "bot",
+            "user",
             admin_session["selected_startup_ids"],
             admin_session["message_template"]
         )
-    ).start()
+    )
+    thread.start()
 
     return jsonify({
         "response_type": "ephemeral",
@@ -196,7 +137,6 @@ def build_admin_home_view():
     current_template = admin_session["message_template"]
     selected_count = startup_count if selected_ids is None else len(selected_ids)
     skipped_count = startup_count - selected_count
-    scheduled_time = admin_session["scheduled_time"]
 
     startup_options = []
     initial_options = []
@@ -211,206 +151,175 @@ def build_admin_home_view():
         if selected_ids is None or slack_id in selected_ids:
             initial_options.append(option)
 
-    # Scheduled send status line
-    if scheduled_time:
-        schedule_line = f"*Scheduled for:*  {scheduled_time.strftime('%d %b %Y at %H:%M')}  —  <cancel>"
-        schedule_status = f"Send locked in for *{scheduled_time.strftime('%d %b %Y at %H:%M')}*. Hit cancel to abort."
-    else:
-        schedule_line = "No send scheduled. Send now or pick a time below."
-        schedule_status = "Send immediately or schedule for later."
+    return {
+        "type": "home",
+        "blocks": [
 
-    blocks = [
-
-        # ── BANNER (colored via image block trick) ─────────────────────
-        # We use a solid-color hosted image as a banner.
-        # Replace the image_url below with your own branded banner if desired.
-        {
-            "type": "image",
-            "image_url": "https://www.solidbackgrounds.com/images/1920x1080/1920x1080-electric-violet-solid-color-background.jpg",
-            "alt_text": "UnicornFactory banner"
-        },
-
-        # ── BRAND HEADER ───────────────────────────────────────────────
-        {
-            "type": "header",
-            "text": {
-                "type": "plain_text",
-                "text": "UnicornFactory",
-                "emoji": False
-            }
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "Outreach that hits different. Select your founders, craft your message, blast it out."
-            }
-        },
-        {"type": "divider"},
-
-        # ── STATS BAND ─────────────────────────────────────────────────
-        {
-            "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*{startup_count}*\nFounders in the roster"},
-                {"type": "mrkdwn", "text": f"*{selected_count}*\nSelected to receive"},
-                {"type": "mrkdwn", "text": f"*{skipped_count}*\nSkipped this round"},
-                {"type": "mrkdwn", "text": "*Admin*\nFull access"}
-            ]
-        },
-        {"type": "divider"},
-
-        # ── RECIPIENTS ─────────────────────────────────────────────────
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "Who's getting this?", "emoji": False}
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "Uncheck anyone you want to skip. Everyone else gets the message."
-            }
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "checkboxes",
-                    "action_id": "startup_selector",
-                    "options": startup_options,
-                    "initial_options": initial_options
+            # ── BRAND HEADER ───────────────────────────────────────────
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "UnicornFactory",
+                    "emoji": False
                 }
-            ]
-        },
-        {"type": "divider"},
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "Outreach that hits different. Select your founders, craft your message, blast it out."
+                }
+            },
+            {"type": "divider"},
 
-        # ── MESSAGE PREVIEW ────────────────────────────────────────────
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "The message", "emoji": False}
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"_{current_template}_"},
-            "accessory": {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Edit", "emoji": False},
-                "action_id": "open_message_editor",
-                "style": "primary"
-            }
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
+            # ── STATS BAND ─────────────────────────────────────────────
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*{startup_count}*\nFounders in the roster"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*{selected_count}*\nSelected to receive"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*{skipped_count}*\nSkipped this round"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": "*Admin*\nFull access"
+                    }
+                ]
+            },
+            {"type": "divider"},
+
+            # ── RECIPIENTS ─────────────────────────────────────────────
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Who's getting this?",
+                    "emoji": False
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "Uncheck anyone you want to skip. Everyone else gets the message."
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "checkboxes",
+                        "action_id": "startup_selector",
+                        "options": startup_options,
+                        "initial_options": initial_options
+                    }
+                ]
+            },
+            {"type": "divider"},
+
+            # ── MESSAGE PREVIEW ────────────────────────────────────────
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "The message",
+                    "emoji": False
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"_{current_template}_"
+                },
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Edit", "emoji": False},
+                    "action_id": "open_message_editor",
+                    "style": "primary"
+                }
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "Live preview  —  "
+                            + current_template.format(founder_name="Maria", startup_name="Acme")
+                        )
+                    }
+                ]
+            },
+            {"type": "divider"},
+
+            # ── LAUNCH ─────────────────────────────────────────────────
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Ready to launch?",
+                    "emoji": False
+                }
+            },
+            {
+                "type": "section",
+                "text": {
                     "type": "mrkdwn",
                     "text": (
-                        "Live preview  —  "
-                        + current_template.format(founder_name="Maria", startup_name="Acme")
+                        f"You're about to reach *{selected_count} founder(s)*. "
+                        f"You'll get a DM the moment it's done."
                     )
                 }
-            ]
-        },
-        {"type": "divider"},
-
-        # ── SCHEDULE ───────────────────────────────────────────────────
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "When to send?", "emoji": False}
-        },
-        {
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": schedule_status}
-        },
-    ]
-
-    # Show cancel button if scheduled, otherwise show schedule button
-    if scheduled_time:
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Cancel scheduled send", "emoji": False},
-                    "action_id": "cancel_scheduled_send",
-                    "style": "danger",
-                    "confirm": {
-                        "title": {"type": "plain_text", "text": "Cancel the scheduled send?"},
-                        "text": {"type": "mrkdwn", "text": "The outreach will not be sent."},
-                        "confirm": {"type": "plain_text", "text": "Yes, cancel it"},
-                        "deny": {"type": "plain_text", "text": "Keep it"}
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Send Messages", "emoji": False},
+                        "style": "primary",
+                        "action_id": "send_messages_button",
+                        "confirm": {
+                            "title": {"type": "plain_text", "text": "Launch outreach?"},
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"This sends your message to *{selected_count} founder(s)* right now. "
+                                    f"No take-backs."
+                                )
+                            },
+                            "confirm": {"type": "plain_text", "text": "Let's go"},
+                            "deny": {"type": "plain_text", "text": "Not yet"}
+                        }
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Reset everything", "emoji": False},
+                        "action_id": "reset_defaults_button"
                     }
-                }
-            ]
-        })
-    else:
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Schedule a send", "emoji": False},
-                    "action_id": "open_scheduler"
-                }
-            ]
-        })
-
-    blocks += [
-        {"type": "divider"},
-
-        # ── LAUNCH ─────────────────────────────────────────────────────
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "Ready to launch?", "emoji": False}
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"You're about to reach *{selected_count} founder(s)*. "
-                    f"You'll get a DM the moment it's done."
-                )
+                ]
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "You can also trigger a send via `/sendmessages` from any channel."
+                    }
+                ]
             }
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Send Now", "emoji": False},
-                    "style": "primary",
-                    "action_id": "send_messages_button",
-                    "confirm": {
-                        "title": {"type": "plain_text", "text": "Launch outreach?"},
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"Sends to *{selected_count} founder(s)* right now. No take-backs."
-                        },
-                        "confirm": {"type": "plain_text", "text": "Let's go"},
-                        "deny": {"type": "plain_text", "text": "Not yet"}
-                    }
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Reset everything", "emoji": False},
-                    "action_id": "reset_defaults_button"
-                }
-            ]
-        },
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": "You can also trigger an immediate send via `/sendmessages` from any channel."
-                }
-            ]
-        }
-    ]
-
-    return {"type": "home", "blocks": blocks}
+        ]
+    }
 
 
 def build_message_editor_modal():
@@ -427,7 +336,8 @@ def build_message_editor_modal():
                     "type": "mrkdwn",
                     "text": (
                         "*Make it yours.*\n"
-                        "Use `{founder_name}` and `{startup_name}` as dynamic placeholders."
+                        "Use `{founder_name}` and `{startup_name}` as dynamic placeholders — "
+                        "they'll be swapped out for each founder automatically."
                     )
                 }
             },
@@ -448,49 +358,9 @@ def build_message_editor_modal():
                 "label": {"type": "plain_text", "text": "Message body", "emoji": False},
                 "hint": {
                     "type": "plain_text",
-                    "text": "Click Save when you're happy with it.",
+                    "text": "Click Save when you're happy with it. The Home tab will update with a live preview.",
                     "emoji": False
                 }
-            }
-        ]
-    }
-
-
-def build_scheduler_modal():
-    return {
-        "type": "modal",
-        "callback_id": "scheduler_modal",
-        "title": {"type": "plain_text", "text": "Schedule a send", "emoji": False},
-        "submit": {"type": "plain_text", "text": "Schedule", "emoji": False},
-        "close": {"type": "plain_text", "text": "Cancel", "emoji": False},
-        "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*Pick a date and time.*\nThe outreach will fire automatically — you'll get a DM confirmation when it's done."
-                }
-            },
-            {"type": "divider"},
-            {
-                "type": "input",
-                "block_id": "schedule_date_block",
-                "element": {
-                    "type": "datepicker",
-                    "action_id": "schedule_date",
-                    "placeholder": {"type": "plain_text", "text": "Pick a date", "emoji": False}
-                },
-                "label": {"type": "plain_text", "text": "Date", "emoji": False}
-            },
-            {
-                "type": "input",
-                "block_id": "schedule_time_block",
-                "element": {
-                    "type": "timepicker",
-                    "action_id": "schedule_time",
-                    "placeholder": {"type": "plain_text", "text": "Pick a time", "emoji": False}
-                },
-                "label": {"type": "plain_text", "text": "Time (your local timezone)", "emoji": False}
             }
         ]
     }
@@ -501,17 +371,19 @@ def build_guest_home_view():
         "type": "home",
         "blocks": [
             {
-                "type": "image",
-                "image_url": "https://www.solidbackgrounds.com/images/1920x1080/1920x1080-electric-violet-solid-color-background.jpg",
-                "alt_text": "UnicornFactory banner"
-            },
-            {
                 "type": "header",
-                "text": {"type": "plain_text", "text": "UnicornFactory", "emoji": False}
+                "text": {
+                    "type": "plain_text",
+                    "text": "UnicornFactory",
+                    "emoji": False
+                }
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "Outreach that hits different."}
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "Outreach that hits different."
+                }
             },
             {"type": "divider"},
             {
@@ -524,7 +396,10 @@ def build_guest_home_view():
             {
                 "type": "context",
                 "elements": [
-                    {"type": "mrkdwn", "text": "UnicornFactory Outreach Bot  ·  Admin access required"}
+                    {
+                        "type": "mrkdwn",
+                        "text": "UnicornFactory Outreach Bot  ·  Admin access required"
+                    }
                 ]
             }
         ]
@@ -566,79 +441,32 @@ def slack_interactions():
 
     # ── Modal submitted ────────────────────────────────────────────────
     if payload_type == "view_submission":
-        callback_id = payload["view"]["callback_id"]
-
-        # Message editor saved
-        if callback_id == "message_editor_modal":
+        if payload["view"]["callback_id"] == "message_editor_modal":
             new_text = (
-                payload.get("view", {}).get("state", {})
-                .get("values", {}).get("message_editor_block", {})
-                .get("message_editor", {}).get("value", "") or ""
+                payload
+                .get("view", {})
+                .get("state", {})
+                .get("values", {})
+                .get("message_editor_block", {})
+                .get("message_editor", {})
+                .get("value", "")
+                or ""
             ).strip()
+
             if new_text:
                 admin_session["message_template"] = new_text
                 print(f"[DEBUG] Message saved: {new_text}")
 
-            threading.Thread(
-                target=lambda: bot_client.views_publish(
-                    user_id=user_id, view=build_admin_home_view()
-                )
-            ).start()
-            return "", 200
-
-        # Scheduler submitted
-        if callback_id == "scheduler_modal":
-            values = payload.get("view", {}).get("state", {}).get("values", {})
-            date_str = values.get("schedule_date_block", {}).get("schedule_date", {}).get("selected_date")
-            time_str = values.get("schedule_time_block", {}).get("schedule_time", {}).get("selected_time")
-
-            if date_str and time_str:
+            def refresh_home():
                 try:
-                    scheduled_dt = datetime.datetime.strptime(
-                        f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
-                    )
-                    admin_session["scheduled_time"] = scheduled_dt
-
-                    schedule_messages(
+                    bot_client.views_publish(
                         user_id=user_id,
-                        selected_ids=admin_session["selected_startup_ids"],
-                        message_template=admin_session["message_template"],
-                        scheduled_time=scheduled_dt
+                        view=build_admin_home_view()
                     )
+                except Exception as e:
+                    print(f"Failed to refresh Home tab: {e}")
 
-                    # Confirm to admin via colored DM
-                    bot_client.chat_postMessage(
-                        channel=user_id,
-                        text=f"Send scheduled for {scheduled_dt.strftime('%d %b %Y at %H:%M')}.",
-                        attachments=[
-                            {
-                                "color": "#7C3AED",
-                                "blocks": [
-                                    {
-                                        "type": "section",
-                                        "text": {
-                                            "type": "mrkdwn",
-                                            "text": (
-                                                f"*Outreach scheduled*\n"
-                                                f"Will fire on *{scheduled_dt.strftime('%d %b %Y at %H:%M')}* "
-                                                f"to *{len(admin_session['selected_startup_ids']) if admin_session['selected_startup_ids'] else len(startups)} founder(s)*."
-                                            )
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    )
-
-                    threading.Thread(
-                        target=lambda: bot_client.views_publish(
-                            user_id=user_id, view=build_admin_home_view()
-                        )
-                    ).start()
-
-                except ValueError as e:
-                    print(f"Failed to parse scheduled time: {e}")
-
+            threading.Thread(target=refresh_home).start()
             return "", 200
 
     # ── Block actions ──────────────────────────────────────────────────
@@ -649,7 +477,7 @@ def slack_interactions():
 
         action_id = actions[0]["action_id"]
 
-        # Open message editor modal — return immediately
+        # ── Open modal — return immediately ────────────────────────────
         if action_id == "open_message_editor":
             try:
                 bot_client.views_open(
@@ -657,36 +485,17 @@ def slack_interactions():
                     view=build_message_editor_modal()
                 )
             except Exception as e:
-                print(f"Failed to open message editor modal: {e}")
+                print(f"Failed to open modal: {e}")
             return "", 200
 
-        # Open scheduler modal — return immediately
-        if action_id == "open_scheduler":
-            try:
-                bot_client.views_open(
-                    trigger_id=payload["trigger_id"],
-                    view=build_scheduler_modal()
-                )
-            except Exception as e:
-                print(f"Failed to open scheduler modal: {e}")
-            return "", 200
-
-        # Cancel scheduled send
-        if action_id == "cancel_scheduled_send":
-            if admin_session["scheduled_timer"] is not None:
-                admin_session["scheduled_timer"].cancel()
-                admin_session["scheduled_timer"] = None
-            admin_session["scheduled_time"] = None
-            print("[DEBUG] Scheduled send cancelled.")
-
-        # Startup selector changed
-        elif action_id == "startup_selector":
+        # ── Startup selector ───────────────────────────────────────────
+        if action_id == "startup_selector":
             selected = actions[0].get("selected_options", [])
             admin_session["selected_startup_ids"] = (
                 {opt["value"] for opt in selected} if selected else set()
             )
 
-        # Send now
+        # ── Send button ────────────────────────────────────────────────
         elif action_id == "send_messages_button":
             threading.Thread(
                 target=process_messages,
@@ -698,14 +507,10 @@ def slack_interactions():
                 )
             ).start()
 
-        # Reset everything
+        # ── Reset button ───────────────────────────────────────────────
         elif action_id == "reset_defaults_button":
-            if admin_session["scheduled_timer"] is not None:
-                admin_session["scheduled_timer"].cancel()
             admin_session["selected_startup_ids"] = None
             admin_session["message_template"] = DEFAULT_MESSAGE_TEMPLATE
-            admin_session["scheduled_time"] = None
-            admin_session["scheduled_timer"] = None
 
         # Refresh Home tab
         try:
