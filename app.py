@@ -139,7 +139,6 @@ def build_admin_home_view():
     current_template = admin_session["message_template"]
     selected_count = startup_count if selected_ids is None else len(selected_ids)
 
-    # Build multi-select options from CSV
     startup_options = []
     initial_options = []
     for _, row in startups.iterrows():
@@ -215,8 +214,8 @@ def build_admin_home_view():
                 }
             },
             {
+                # No dispatch_action — value is read reliably at send-time from payload state
                 "type": "input",
-                "dispatch_action": True,
                 "block_id": "message_editor_block",
                 "element": {
                     "type": "plain_text_input",
@@ -231,7 +230,7 @@ def build_admin_home_view():
                 "label": {"type": "plain_text", "text": "Message body", "emoji": False},
                 "hint": {
                     "type": "plain_text",
-                    "text": "Changes are saved automatically. Use {founder_name} and {startup_name} as placeholders.",
+                    "text": "Use {founder_name} and {startup_name} as placeholders. The message is captured when you press Send.",
                     "emoji": False
                 }
             },
@@ -357,23 +356,9 @@ def slack_interactions():
                 {opt["value"] for opt in selected} if selected else set()
             )
 
-        # ── Message editor updated ─────────────────────────────────────
-        elif action_id == "message_editor":
-            new_text = (
-                payload
-                .get("state", {})
-                .get("values", {})
-                .get("message_editor_block", {})
-                .get("message_editor", {})
-                .get("value", "")
-                or ""
-            ).strip()
-            if new_text:
-                admin_session["message_template"] = new_text
-
         # ── Send button ────────────────────────────────────────────────
         elif action_id == "send_messages_button":
-            # Read latest message state at send-time as a safety net
+            # Read message directly from form state at click-time — most reliable approach
             latest_text = (
                 payload
                 .get("state", {})
@@ -383,8 +368,12 @@ def slack_interactions():
                 .get("value", "")
                 or ""
             ).strip()
+
             if latest_text:
                 admin_session["message_template"] = latest_text
+                print(f"[DEBUG] Captured message at send-time: {latest_text}")
+            else:
+                print(f"[DEBUG] No message captured, falling back to session: {admin_session['message_template']}")
 
             thread = threading.Thread(
                 target=process_messages,
@@ -402,7 +391,7 @@ def slack_interactions():
             admin_session["selected_startup_ids"] = None
             admin_session["message_template"] = DEFAULT_MESSAGE_TEMPLATE
 
-    # Refresh the Home tab after any interaction
+    # Refresh Home tab — initial_value now reflects whatever was last sent or saved
     try:
         bot_client.views_publish(
             user_id=user_id,
