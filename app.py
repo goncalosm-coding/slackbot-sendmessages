@@ -4,8 +4,13 @@ import pandas as pd
 import os
 import time
 import threading
+import json
 
 app = Flask(__name__)
+
+# =========================
+# CONFIGURATION
+# =========================
 
 # Load Slack token from environment
 SLACK_TOKEN = os.environ.get("SLACK_TOKEN")
@@ -35,21 +40,15 @@ MESSAGE_TEMPLATE = (
     "e queria compartilhar algo com você!"
 )
 
-@app.route("/")
-def home():
-    return "✅ Slack bot is running! Use /sendmessages in Slack."
-
+# =========================
+# CORE MESSAGE PROCESSING
+# =========================
 
 def process_messages(user_id):
-    """
-    Runs in background thread.
-    Sends DMs safely and updates the command user.
-    """
     total_sent = 0
 
     for _, row in startups.iterrows():
         slack_id = row.get("slack_user_id")
-
         if pd.isna(slack_id) or not slack_id:
             continue
 
@@ -65,7 +64,7 @@ def process_messages(user_id):
         except Exception as e:
             print(f"❌ Failed to send to {slack_id}: {e}")
 
-    # Notify command executor when done
+    # Notify the admin when done
     try:
         client.chat_postMessage(
             channel=user_id,
@@ -75,27 +74,106 @@ def process_messages(user_id):
         print(f"❌ Could not notify admin: {e}")
 
 
+# =========================
+# ROOT / HEALTH CHECK
+# =========================
+
+@app.route("/")
+def home():
+    return "✅ Slack bot is running! Use /sendmessages or open the Home tab."
+
+
+# =========================
+# SLASH COMMAND
+# =========================
+
 @app.route("/sendmessages", methods=["POST"])
 def send_messages():
-    """
-    Slack slash command handler.
-    MUST respond within 3 seconds.
-    """
-
     user_id = request.form.get("user_id")
 
-    # Immediately respond to Slack (prevents timeout)
     response = {
         "response_type": "ephemeral",
         "text": "✅ Slack acknowledged! Sending messages now..."
     }
 
-    # Start background thread
+    # Run in background thread
     thread = threading.Thread(target=process_messages, args=(user_id,))
     thread.start()
 
     return jsonify(response), 200
 
+
+# =========================
+# SLACK EVENTS (HOME TAB + URL VERIFICATION)
+# =========================
+
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    data = request.json
+
+    # 1️⃣ URL verification
+    if data.get("type") == "url_verification":
+        return jsonify({"challenge": data["challenge"]})
+
+    # 2️⃣ Home tab opened
+    if data.get("event", {}).get("type") == "app_home_opened":
+        user_id = data["event"]["user"]
+
+        client.views_publish(
+            user_id=user_id,
+            view={
+                "type": "home",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": "*🚀 SendMessagesBot Dashboard*"}
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "Click the button below to send messages to all startups."
+                        }
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "🚀 Send Messages"},
+                                "action_id": "send_messages_button"
+                            }
+                        ]
+                    }
+                ]
+            }
+        )
+
+    return "", 200
+
+
+# =========================
+# BUTTON INTERACTIONS
+# =========================
+
+@app.route("/slack/interactions", methods=["POST"])
+def slack_interactions():
+    payload = json.loads(request.form["payload"])
+
+    if payload["type"] == "block_actions":
+        action_id = payload["actions"][0]["action_id"]
+        user_id = payload["user"]["id"]
+
+        if action_id == "send_messages_button":
+            thread = threading.Thread(target=process_messages, args=(user_id,))
+            thread.start()
+
+    return "", 200
+
+
+# =========================
+# RUN APP
+# =========================
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
