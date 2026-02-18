@@ -3,6 +3,7 @@ from slack_sdk import WebClient
 import pandas as pd
 import os
 import time
+import queue
 import threading
 
 app = Flask(__name__)
@@ -35,12 +36,49 @@ MESSAGE_TEMPLATE = (
     "e queria compartilhar algo com você!"
 )
 
+# Thread-safe queue for messages
+message_queue = queue.Queue()
+
+def worker():
+    """Worker thread to send Slack messages one by one."""
+    while True:
+        slack_id, message = message_queue.get()
+        try:
+            client.chat_postMessage(channel=slack_id, text=message)
+            print(f"✅ Message sent to {slack_id}")
+        except Exception as e:
+            print(f"❌ Failed to send to {slack_id}: {e}")
+        time.sleep(1)  # Slack rate limit
+        message_queue.task_done()
+
+# Start a pool of 3 worker threads
+for _ in range(3):
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
 @app.route("/")
 def home():
     return "✅ Slack bot is running! Use /sendmessages in Slack."
 
-def send_messages_background():
-    """Send messages to all founders in the CSV, one by one."""
+@app.route("/sendmessages", methods=["POST"])
+def send_messages():
+    """
+    Triggered by Slack slash command.
+    Queues messages in the background.
+    """
+    channel_id = request.form.get("channel_id")
+
+    # Immediate response to Slack to avoid timeout
+    if channel_id:
+        try:
+            client.chat_postMessage(
+                channel=channel_id,
+                text="✅ Slack acknowledged! Messages are being queued in the background..."
+            )
+        except Exception as e:
+            print(f"❌ Failed to notify Slack user: {e}")
+
+    # Queue messages for all founders
     for _, row in startups.iterrows():
         slack_id = row.get("slack_user_id")
         if pd.isna(slack_id) or not slack_id:
@@ -51,36 +89,9 @@ def send_messages_background():
             founder_name=row.get("founder_name", "Founder"),
             startup_name=row.get("startup_name", "Startup")
         )
+        message_queue.put((slack_id, message))
 
-        try:
-            client.chat_postMessage(channel=slack_id, text=message)
-            print(f"✅ Message sent to {row.get('founder_name', 'Unknown')}")
-            time.sleep(1)  # avoid Slack rate limits
-        except Exception as e:
-            print(f"❌ Failed to send to {row.get('founder_name', 'Unknown')}: {e}")
-
-@app.route("/sendmessages", methods=["POST"])
-def send_messages():
-    """
-    Triggered by the Slack slash command.
-    Responds immediately to avoid timeout, then sends messages in the background.
-    """
-    channel_id = request.form.get("channel_id")
-
-    # Respond immediately to Slack
-    if channel_id:
-        try:
-            client.chat_postMessage(
-                channel=channel_id, text="✅ Mensagens estão sendo enviadas em segundo plano..."
-            )
-        except Exception as e:
-            print(f"❌ Failed to notify user: {e}")
-
-    # Start background thread to send messages
-    threading.Thread(target=send_messages_background, daemon=True).start()
-
-    # Immediate response to Slack to prevent operation_timeout
-    return jsonify({"text": "✅ Slack acknowledged! Messages are being sent..."})
+    return jsonify({"text": "✅ Messages are queued and being sent in the background!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
