@@ -40,9 +40,8 @@ DEFAULT_MESSAGE_TEMPLATE = (
     "e queria compartilhar algo com você!"
 )
 
-# In-memory session state
 admin_session = {
-    "selected_startup_ids": None,  # None = all selected
+    "selected_startup_ids": None,
     "message_template": DEFAULT_MESSAGE_TEMPLATE
 }
 
@@ -60,8 +59,7 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
     source = "USER" if client_type == "user" else "BOT"
     template = message_template or DEFAULT_MESSAGE_TEMPLATE
 
-    print(f"[DEBUG] Sending messages as {source}")
-    print(f"[DEBUG] Using template: {template}")
+    print(f"[DEBUG] Sending as {source} with template: {template}")
 
     for _, row in startups.iterrows():
         slack_id = str(row.get("slack_user_id", ""))
@@ -130,7 +128,7 @@ def send_messages():
     }), 200
 
 # =========================
-# HOME TAB VIEWS
+# HOME TAB VIEW
 # =========================
 
 def build_admin_home_view():
@@ -202,36 +200,24 @@ def build_admin_home_view():
             },
             {"type": "divider"},
 
-            # ── MESSAGE EDITOR ─────────────────────────────────────────
+            # ── MESSAGE PREVIEW + EDIT BUTTON ──────────────────────────
             {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        "*Message template*\n"
-                        "Edit the message below. Use `{founder_name}` and `{startup_name}` as dynamic placeholders."
-                    )
+                    "text": "*Message template*"
                 }
             },
             {
-                # No dispatch_action — value is read reliably at send-time from payload state
-                "type": "input",
-                "block_id": "message_editor_block",
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "message_editor",
-                    "multiline": True,
-                    "initial_value": current_template,
-                    "placeholder": {
-                        "type": "plain_text",
-                        "text": "Write your message here..."
-                    }
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f">{current_template}"
                 },
-                "label": {"type": "plain_text", "text": "Message body", "emoji": False},
-                "hint": {
-                    "type": "plain_text",
-                    "text": "Use {founder_name} and {startup_name} as placeholders. The message is captured when you press Send.",
-                    "emoji": False
+                "accessory": {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Edit message", "emoji": False},
+                    "action_id": "open_message_editor"
                 }
             },
             {
@@ -280,6 +266,40 @@ def build_admin_home_view():
                         "action_id": "reset_defaults_button"
                     }
                 ]
+            }
+        ]
+    }
+
+
+def build_message_editor_modal():
+    return {
+        "type": "modal",
+        "callback_id": "message_editor_modal",
+        "title": {"type": "plain_text", "text": "Edit message", "emoji": False},
+        "submit": {"type": "plain_text", "text": "Save", "emoji": False},
+        "close": {"type": "plain_text", "text": "Cancel", "emoji": False},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "Use `{founder_name}` and `{startup_name}` as dynamic placeholders."
+                }
+            },
+            {
+                "type": "input",
+                "block_id": "message_editor_block",
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "message_editor",
+                    "multiline": True,
+                    "initial_value": admin_session["message_template"],
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Write your message here..."
+                    }
+                },
+                "label": {"type": "plain_text", "text": "Message body", "emoji": False}
             }
         ]
     }
@@ -341,11 +361,44 @@ def slack_events():
 @app.route("/slack/interactions", methods=["POST"])
 def slack_interactions():
     payload = json.loads(request.form["payload"])
+    payload_type = payload.get("type")
     user_id = payload["user"]["id"]
 
     if user_id != ADMIN_USER_ID:
         return "", 200
 
+    # ── Modal submitted ────────────────────────────────────────────────
+    if payload_type == "view_submission":
+        callback_id = payload["view"]["callback_id"]
+
+        if callback_id == "message_editor_modal":
+            new_text = (
+                payload
+                .get("view", {})
+                .get("state", {})
+                .get("values", {})
+                .get("message_editor_block", {})
+                .get("message_editor", {})
+                .get("value", "")
+                or ""
+            ).strip()
+
+            if new_text:
+                admin_session["message_template"] = new_text
+                print(f"[DEBUG] Message saved from modal: {new_text}")
+
+            # Refresh Home tab after modal closes
+            try:
+                bot_client.views_publish(
+                    user_id=user_id,
+                    view=build_admin_home_view()
+                )
+            except Exception as e:
+                print(f"Failed to refresh Home tab after modal: {e}")
+
+            return "", 200
+
+    # ── Block actions ──────────────────────────────────────────────────
     for action in payload.get("actions", []):
         action_id = action["action_id"]
 
@@ -356,25 +409,19 @@ def slack_interactions():
                 {opt["value"] for opt in selected} if selected else set()
             )
 
+        # ── Open message editor modal ──────────────────────────────────
+        elif action_id == "open_message_editor":
+            try:
+                bot_client.views_open(
+                    trigger_id=payload["trigger_id"],
+                    view=build_message_editor_modal()
+                )
+            except Exception as e:
+                print(f"Failed to open modal: {e}")
+            return "", 200  # Return immediately — don't refresh Home tab yet
+
         # ── Send button ────────────────────────────────────────────────
         elif action_id == "send_messages_button":
-            # Read message directly from form state at click-time — most reliable approach
-            latest_text = (
-                payload
-                .get("state", {})
-                .get("values", {})
-                .get("message_editor_block", {})
-                .get("message_editor", {})
-                .get("value", "")
-                or ""
-            ).strip()
-
-            if latest_text:
-                admin_session["message_template"] = latest_text
-                print(f"[DEBUG] Captured message at send-time: {latest_text}")
-            else:
-                print(f"[DEBUG] No message captured, falling back to session: {admin_session['message_template']}")
-
             thread = threading.Thread(
                 target=process_messages,
                 args=(
@@ -391,7 +438,7 @@ def slack_interactions():
             admin_session["selected_startup_ids"] = None
             admin_session["message_template"] = DEFAULT_MESSAGE_TEMPLATE
 
-    # Refresh Home tab — initial_value now reflects whatever was last sent or saved
+    # Refresh Home tab after any action (except modal open, handled above)
     try:
         bot_client.views_publish(
             user_id=user_id,
