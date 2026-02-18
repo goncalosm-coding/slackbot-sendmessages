@@ -40,10 +40,9 @@ DEFAULT_MESSAGE_TEMPLATE = (
     "e queria compartilhar algo com você!"
 )
 
-# In-memory session state per admin interaction
-# Stores: selected startup IDs and custom message template
+# In-memory session state
 admin_session = {
-    "selected_startup_ids": None,   # None = all selected
+    "selected_startup_ids": None,  # None = all selected
     "message_template": DEFAULT_MESSAGE_TEMPLATE
 }
 
@@ -62,14 +61,14 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
     template = message_template or DEFAULT_MESSAGE_TEMPLATE
 
     print(f"[DEBUG] Sending messages as {source}")
+    print(f"[DEBUG] Using template: {template}")
 
     for _, row in startups.iterrows():
-        slack_id = row.get("slack_user_id")
-        if pd.isna(slack_id) or not slack_id:
+        slack_id = str(row.get("slack_user_id", ""))
+        if not slack_id or slack_id == "nan":
             continue
 
-        # Filter by selected startups if provided
-        if selected_ids is not None and str(slack_id) not in selected_ids:
+        if selected_ids is not None and slack_id not in selected_ids:
             continue
 
         message = template.format(
@@ -116,7 +115,12 @@ def send_messages():
 
     thread = threading.Thread(
         target=process_messages,
-        args=(user_id, "user", admin_session["selected_startup_ids"], admin_session["message_template"])
+        args=(
+            user_id,
+            "user",
+            admin_session["selected_startup_ids"],
+            admin_session["message_template"]
+        )
     )
     thread.start()
 
@@ -146,7 +150,6 @@ def build_admin_home_view():
             "value": slack_id
         }
         startup_options.append(option)
-        # Pre-select all by default, or restore saved selection
         if selected_ids is None or slack_id in selected_ids:
             initial_options.append(option)
 
@@ -154,7 +157,7 @@ def build_admin_home_view():
         "type": "home",
         "blocks": [
 
-            # ── HERO BAND ──────────────────────────────────────────────
+            # ── HERO ───────────────────────────────────────────────────
             {
                 "type": "section",
                 "text": {
@@ -174,7 +177,7 @@ def build_admin_home_view():
                     {"type": "mrkdwn", "text": f"*Total founders*\n{startup_count}"},
                     {"type": "mrkdwn", "text": f"*Currently selected*\n{selected_count}"},
                     {"type": "mrkdwn", "text": "*Access level*\nAdmin"},
-                    {"type": "mrkdwn", "text": f"*Trigger*\nHome tab  ·  `/sendmessages`"}
+                    {"type": "mrkdwn", "text": "*Trigger*\nHome tab  ·  `/sendmessages`"}
                 ]
             },
             {"type": "divider"},
@@ -182,7 +185,10 @@ def build_admin_home_view():
             # ── RECIPIENT SELECTOR ─────────────────────────────────────
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "*Recipients*\nChoose which founders will receive the message. Deselect any you want to skip."}
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Recipients*\nChoose which founders will receive the message. Deselect any you want to skip."
+                }
             },
             {
                 "type": "actions",
@@ -225,7 +231,7 @@ def build_admin_home_view():
                 "label": {"type": "plain_text", "text": "Message body", "emoji": False},
                 "hint": {
                     "type": "plain_text",
-                    "text": "Changes are saved automatically as you type and confirmed when you hit Enter or click outside the field.",
+                    "text": "Changes are saved automatically. Use {founder_name} and {startup_name} as placeholders.",
                     "emoji": False
                 }
             },
@@ -235,7 +241,7 @@ def build_admin_home_view():
                     {
                         "type": "mrkdwn",
                         "text": (
-                            f"*Preview:*  "
+                            "*Preview:*  "
                             + current_template.format(founder_name="Maria", startup_name="Acme")
                         )
                     }
@@ -341,7 +347,6 @@ def slack_interactions():
     if user_id != ADMIN_USER_ID:
         return "", 200
 
-    # Handle block actions
     for action in payload.get("actions", []):
         action_id = action["action_id"]
 
@@ -354,12 +359,33 @@ def slack_interactions():
 
         # ── Message editor updated ─────────────────────────────────────
         elif action_id == "message_editor":
-            new_text = action.get("value", "").strip()
+            new_text = (
+                payload
+                .get("state", {})
+                .get("values", {})
+                .get("message_editor_block", {})
+                .get("message_editor", {})
+                .get("value", "")
+                or ""
+            ).strip()
             if new_text:
                 admin_session["message_template"] = new_text
 
         # ── Send button ────────────────────────────────────────────────
         elif action_id == "send_messages_button":
+            # Read latest message state at send-time as a safety net
+            latest_text = (
+                payload
+                .get("state", {})
+                .get("values", {})
+                .get("message_editor_block", {})
+                .get("message_editor", {})
+                .get("value", "")
+                or ""
+            ).strip()
+            if latest_text:
+                admin_session["message_template"] = latest_text
+
             thread = threading.Thread(
                 target=process_messages,
                 args=(
