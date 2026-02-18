@@ -200,7 +200,7 @@ def build_admin_home_view():
             },
             {"type": "divider"},
 
-            # ── MESSAGE PREVIEW + EDIT BUTTON ──────────────────────────
+            # ── MESSAGE PREVIEW ────────────────────────────────────────
             {
                 "type": "section",
                 "text": {
@@ -225,9 +225,8 @@ def build_admin_home_view():
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": (
-                            "*Preview:*  "
-                            + current_template.format(founder_name="Maria", startup_name="Acme")
+                        "text": "*Preview:*  " + current_template.format(
+                            founder_name="Maria", startup_name="Acme"
                         )
                     }
                 ]
@@ -283,7 +282,7 @@ def build_message_editor_modal():
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": "Use `{founder_name}` and `{startup_name}` as dynamic placeholders."
+                    "text": "Use `{founder_name}` and `{startup_name}` as placeholders."
                 }
             },
             {
@@ -367,11 +366,9 @@ def slack_interactions():
     if user_id != ADMIN_USER_ID:
         return "", 200
 
-    # ── Modal submitted ────────────────────────────────────────────────
+    # ── Modal submitted (Save button clicked) ──────────────────────────
     if payload_type == "view_submission":
-        callback_id = payload["view"]["callback_id"]
-
-        if callback_id == "message_editor_modal":
+        if payload["view"]["callback_id"] == "message_editor_modal":
             new_text = (
                 payload
                 .get("view", {})
@@ -385,32 +382,33 @@ def slack_interactions():
 
             if new_text:
                 admin_session["message_template"] = new_text
-                print(f"[DEBUG] Message saved from modal: {new_text}")
+                print(f"[DEBUG] Message saved: {new_text}")
 
-            # Refresh Home tab after modal closes
-            try:
-                bot_client.views_publish(
-                    user_id=user_id,
-                    view=build_admin_home_view()
-                )
-            except Exception as e:
-                print(f"Failed to refresh Home tab after modal: {e}")
+            # Refresh Home tab in background — must return immediately first
+            def refresh_home():
+                try:
+                    bot_client.views_publish(
+                        user_id=user_id,
+                        view=build_admin_home_view()
+                    )
+                except Exception as e:
+                    print(f"Failed to refresh Home tab: {e}")
 
+            threading.Thread(target=refresh_home).start()
+
+            # Return immediately to close the modal with no errors
             return "", 200
 
     # ── Block actions ──────────────────────────────────────────────────
-    for action in payload.get("actions", []):
-        action_id = action["action_id"]
+    if payload_type == "block_actions":
+        actions = payload.get("actions", [])
+        if not actions:
+            return "", 200
 
-        # ── Startup multi-select changed ───────────────────────────────
-        if action_id == "startup_selector":
-            selected = action.get("selected_options", [])
-            admin_session["selected_startup_ids"] = (
-                {opt["value"] for opt in selected} if selected else set()
-            )
+        action_id = actions[0]["action_id"]
 
-        # ── Open message editor modal ──────────────────────────────────
-        elif action_id == "open_message_editor":
+        # ── Open message editor modal — must return IMMEDIATELY ────────
+        if action_id == "open_message_editor":
             try:
                 bot_client.views_open(
                     trigger_id=payload["trigger_id"],
@@ -418,11 +416,19 @@ def slack_interactions():
                 )
             except Exception as e:
                 print(f"Failed to open modal: {e}")
-            return "", 200  # Return immediately — don't refresh Home tab yet
+            # Return immediately — trigger_id expires in 3 seconds
+            return "", 200
+
+        # ── Startup selector changed ───────────────────────────────────
+        if action_id == "startup_selector":
+            selected = actions[0].get("selected_options", [])
+            admin_session["selected_startup_ids"] = (
+                {opt["value"] for opt in selected} if selected else set()
+            )
 
         # ── Send button ────────────────────────────────────────────────
         elif action_id == "send_messages_button":
-            thread = threading.Thread(
+            threading.Thread(
                 target=process_messages,
                 args=(
                     user_id,
@@ -430,22 +436,21 @@ def slack_interactions():
                     admin_session["selected_startup_ids"],
                     admin_session["message_template"]
                 )
-            )
-            thread.start()
+            ).start()
 
         # ── Reset button ───────────────────────────────────────────────
         elif action_id == "reset_defaults_button":
             admin_session["selected_startup_ids"] = None
             admin_session["message_template"] = DEFAULT_MESSAGE_TEMPLATE
 
-    # Refresh Home tab after any action (except modal open, handled above)
-    try:
-        bot_client.views_publish(
-            user_id=user_id,
-            view=build_admin_home_view()
-        )
-    except Exception as e:
-        print(f"Failed to refresh Home tab: {e}")
+        # Refresh Home tab for all actions except modal open (handled above)
+        try:
+            bot_client.views_publish(
+                user_id=user_id,
+                view=build_admin_home_view()
+            )
+        except Exception as e:
+            print(f"Failed to refresh Home tab: {e}")
 
     return "", 200
 
