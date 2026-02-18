@@ -3,7 +3,7 @@ from slack_sdk import WebClient
 import pandas as pd
 import os
 import time
-import requests
+import threading
 
 app = Flask(__name__)
 
@@ -39,27 +39,14 @@ MESSAGE_TEMPLATE = (
 def home():
     return "✅ Slack bot is running! Use /sendmessages in Slack."
 
-@app.route("/sendmessages", methods=["POST"])
-def send_messages():
+
+def process_messages(user_id):
     """
-    Slack slash command handler.
-    Uses response_url to avoid timeout.
+    Runs in background thread.
+    Sends DMs safely and updates the command user.
     """
-
-    response_url = request.form.get("response_url")
-
-    # 1️⃣ Immediate response (Slack requires <3s)
-    immediate_response = {
-        "response_type": "ephemeral",
-        "text": "✅ Slack acknowledged! Sending messages now..."
-    }
-
-    # Send immediate acknowledgement
-    requests.post(response_url, json=immediate_response)
-
     total_sent = 0
 
-    # 2️⃣ Process CSV synchronously
     for _, row in startups.iterrows():
         slack_id = row.get("slack_user_id")
 
@@ -74,19 +61,40 @@ def send_messages():
         try:
             client.chat_postMessage(channel=slack_id, text=message)
             total_sent += 1
-            time.sleep(1)  # Slack rate limit
+            time.sleep(1)  # rate limit safety
         except Exception as e:
             print(f"❌ Failed to send to {slack_id}: {e}")
 
-    # 3️⃣ Final completion message
-    final_response = {
+    # Notify command executor when done
+    try:
+        client.chat_postMessage(
+            channel=user_id,
+            text=f"✅ Finished sending {total_sent} messages."
+        )
+    except Exception as e:
+        print(f"❌ Could not notify admin: {e}")
+
+
+@app.route("/sendmessages", methods=["POST"])
+def send_messages():
+    """
+    Slack slash command handler.
+    MUST respond within 3 seconds.
+    """
+
+    user_id = request.form.get("user_id")
+
+    # Immediately respond to Slack (prevents timeout)
+    response = {
         "response_type": "ephemeral",
-        "text": f"✅ Finished sending {total_sent} messages."
+        "text": "✅ Slack acknowledged! Sending messages now..."
     }
 
-    requests.post(response_url, json=final_response)
+    # Start background thread
+    thread = threading.Thread(target=process_messages, args=(user_id,))
+    thread.start()
 
-    return "", 200
+    return jsonify(response), 200
 
 
 if __name__ == "__main__":
