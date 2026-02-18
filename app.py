@@ -51,10 +51,13 @@ def worker():
         time.sleep(1)  # Slack rate limit
         message_queue.task_done()
 
-# Start a pool of 3 worker threads
-for _ in range(3):
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+# Start workers once per Gunicorn worker
+@app.before_first_request
+def start_workers():
+    for _ in range(3):  # number of threads
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+    print("🟢 Slack message worker threads started!")
 
 @app.route("/")
 def home():
@@ -68,7 +71,7 @@ def send_messages():
     """
     channel_id = request.form.get("channel_id")
 
-    # Immediate response to Slack to avoid timeout
+    # Immediate response to Slack
     if channel_id:
         try:
             client.chat_postMessage(
