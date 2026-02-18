@@ -118,6 +118,158 @@ def send_messages():
     return jsonify(response), 200
 
 # =========================
+# HOME TAB VIEWS
+# =========================
+
+def build_admin_home_view(startup_count):
+    return {
+        "type": "home",
+        "blocks": [
+            # Hero header
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🚀 SendMessagesBot",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Your outreach command center.*\nSend personalized messages to every founder in your workspace — instantly, at scale."
+                }
+            },
+            {"type": "divider"},
+
+            # Stats row
+            {
+                "type": "section",
+                "fields": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"📋 *Startups loaded*\n{startup_count} founders ready"
+                    },
+                    {
+                        "type": "mrkdwn",
+                        "text": "🔒 *Access level*\nAdmin"
+                    }
+                ]
+            },
+            {"type": "divider"},
+
+            # Message preview section
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*📝 Message preview*"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "> Olá _[Founder Name]_, tenho acompanhado a _[Startup Name]_ "
+                        "e queria compartilhar algo com você!"
+                    )
+                }
+            },
+            {"type": "divider"},
+
+            # How to use section
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*⚡ How to send*"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "• Press *Send Messages* below to broadcast via the bot\n"
+                        "• Use `/sendmessages` in any channel to send as yourself"
+                    )
+                }
+            },
+            {"type": "divider"},
+
+            # CTA button
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "🚀  Send Messages Now",
+                            "emoji": True
+                        },
+                        "style": "primary",
+                        "action_id": "send_messages_button"
+                    }
+                ]
+            },
+
+            # Footer
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "⚠️ This will send a message to *every founder* in the CSV. You'll receive a DM confirmation when it's done."
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def build_guest_home_view():
+    return {
+        "type": "home",
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🚀 SendMessagesBot",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Your outreach command center.*\nPersonalized messages delivered to every founder in your workspace."
+                }
+            },
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "🔒 *Access restricted*\nOnly the workspace admin can trigger outreach campaigns."
+                }
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "If you believe you should have access, please contact your admin."
+                    }
+                ]
+            }
+        ]
+    }
+
+# =========================
 # SLACK EVENTS (HOME TAB + URL VERIFICATION)
 # =========================
 
@@ -135,31 +287,13 @@ def slack_events():
 
         try:
             if user_id == ADMIN_USER_ID:
-                # Admin sees interactive button
-                bot_client.views_publish(
-                    user_id=user_id,
-                    view={
-                        "type": "home",
-                        "blocks": [
-                            {"type": "section", "text": {"type": "mrkdwn", "text": "*🚀 SendMessagesBot Dashboard*"}},
-                            {"type": "section", "text": {"type": "mrkdwn", "text": "Click the button below to send messages to all startups as BOT."}},
-                            {"type": "actions", "elements": [
-                                {"type": "button", "text": {"type": "plain_text", "text": "🚀 Send Messages"}, "action_id": "send_messages_button"}
-                            ]}
-                        ]
-                    }
-                )
+                startup_count = len(startups)
+                view = build_admin_home_view(startup_count)
             else:
-                # Regular users see info only
-                bot_client.views_publish(
-                    user_id=user_id,
-                    view={
-                        "type": "home",
-                        "blocks": [
-                            {"type": "section", "text": {"type": "mrkdwn", "text": "👋 Hi! Only the admin can send messages."}}
-                        ]
-                    }
-                )
+                view = build_guest_home_view()
+
+            bot_client.views_publish(user_id=user_id, view=view)
+
         except Exception as e:
             print(f"❌ Failed to publish Home tab: {e}")
 
