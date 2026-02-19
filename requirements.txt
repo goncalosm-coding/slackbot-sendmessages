@@ -1,6 +1,7 @@
-Flask
+flask
 slack_sdk
 pandas
-gunicorn
-requests
 pytz
+gunicorn
+notion-client
+requests
