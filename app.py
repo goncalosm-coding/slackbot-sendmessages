@@ -93,6 +93,111 @@ RUNWAY_ALERT_THRESHOLD = 6
 MRR_DROP_ALERT = True
 
 # =========================
+# NOTION DATA SOURCE HELPER
+# =========================
+
+# Cache the data_source_id so we only fetch it once per app startup
+_data_source_id_cache = None
+
+def get_data_source_id():
+    """
+    Fetch and cache the data_source_id for our database.
+    Required by Notion API version 2025-09-03.
+    """
+    global _data_source_id_cache
+    if _data_source_id_cache:
+        return _data_source_id_cache
+
+    try:
+        response = requests.get(
+            f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}",
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Notion-Version": "2025-09-03"
+            }
+        )
+        data = response.json()
+        data_sources = data.get("data_sources", [])
+        if not data_sources:
+            raise Exception("No data sources found for this database.")
+        _data_source_id_cache = data_sources[0]["id"]
+        print(f"[DEBUG] Fetched data_source_id: {_data_source_id_cache}")
+        return _data_source_id_cache
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch data_source_id: {e}")
+        return None
+
+
+def notion_query(filters=None, sorts=None, page_size=100):
+    """
+    Query the Notion data source using the new 2025-09-03 API endpoint.
+    """
+    data_source_id = get_data_source_id()
+    if not data_source_id:
+        print("[ERROR] Cannot query — no data_source_id available.")
+        return []
+
+    body = {}
+    if filters:
+        body["filter"] = filters
+    if sorts:
+        body["sorts"] = sorts
+    if page_size:
+        body["page_size"] = page_size
+
+    try:
+        response = requests.post(
+            f"https://api.notion.com/v1/data_sources/{data_source_id}/query",
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Notion-Version": "2025-09-03",
+                "Content-Type": "application/json"
+            },
+            json=body
+        )
+        result = response.json()
+        return result.get("results", [])
+    except Exception as e:
+        print(f"[ERROR] Notion query failed: {e}")
+        return []
+
+
+def notion_create_page(properties):
+    """
+    Create a page in the Notion data source using the new 2025-09-03 API.
+    Uses data_source_id as parent instead of database_id.
+    """
+    data_source_id = get_data_source_id()
+    if not data_source_id:
+        print("[ERROR] Cannot create page — no data_source_id available.")
+        return False
+
+    try:
+        response = requests.post(
+            "https://api.notion.com/v1/pages",
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Notion-Version": "2025-09-03",
+                "Content-Type": "application/json"
+            },
+            json={
+                "parent": {
+                    "type": "data_source_id",
+                    "data_source_id": data_source_id
+                },
+                "properties": properties
+            }
+        )
+        if response.status_code == 200:
+            return True
+        else:
+            print(f"[ERROR] Notion page creation failed: {response.text}")
+            return False
+    except Exception as e:
+        print(f"[ERROR] Notion page creation exception: {e}")
+        return False
+
+# =========================
 # AI COMPANY MATCHING
 # =========================
 
@@ -108,10 +213,12 @@ def match_company_with_ai(raw_name):
                 {
                     "role": "system",
                     "content": (
-                        "You are a company name matcher. Given a name typed by a user "
-                        "and a list of known company names, return the single best match "
-                        "from the list. Return ONLY the exact company name from the list, "
-                        "nothing else. If there is no reasonable match, return 'Unknown'."
+                        "You are a company name matcher for a startup portfolio. "
+                        "Given a name typed by a user and a list of known company names, "
+                        "return the single best match from the list even if it is only a partial match. "
+                        "For example 'Gamma' should match 'Gamma FinTech'. "
+                        "Return ONLY the exact company name from the list, nothing else. "
+                        "Only return 'Unknown' if there is truly no reasonable match at all."
                     )
                 },
                 {
@@ -137,32 +244,18 @@ def match_company_with_ai(raw_name):
 
 def get_previous_mrr(company_name):
     """Fetch the most recent MRR entry for a company from Notion."""
-    try:
-        results = notion.databases.query(
-            database_id=NOTION_DATABASE_ID,
-            filter={
-                "property": "Company",
-                "title": {
-                    "equals": company_name
-                }
-            },
-            sorts=[
-                {
-                    "property": "Date",
-                    "direction": "descending"
-                }
-            ],
-            page_size=1
-        )
-        pages = results.get("results", [])
-        if not pages:
-            return None
-        props = pages[0]["properties"]
-        mrr_prop = props.get("MRR (€)", {})
-        return mrr_prop.get("number", None)
-    except Exception as e:
-        print(f"[ERROR] Failed to fetch previous MRR for {company_name}: {e}")
+    pages = notion_query(
+        filters={
+            "property": "Company",
+            "title": {"equals": company_name}
+        },
+        sorts=[{"property": "Date", "direction": "descending"}],
+        page_size=1
+    )
+    if not pages:
         return None
+    props = pages[0]["properties"]
+    return props.get("MRR (€)", {}).get("number", None)
 
 
 def get_latest_entry_per_company(month_start):
@@ -170,23 +263,14 @@ def get_latest_entry_per_company(month_start):
     Query all responses from this month and return only the
     most recent entry per company, to avoid duplicates in the digest.
     """
-    try:
-        results = notion.databases.query(
-            database_id=NOTION_DATABASE_ID,
-            filter={
-                "property": "Date",
-                "date": {
-                    "on_or_after": month_start
-                }
-            },
-            sorts=[{"property": "Date", "direction": "descending"}]
-        )
-        pages = results.get("results", [])
-    except Exception as e:
-        print(f"[ERROR] Failed to query Notion: {e}")
-        return []
+    pages = notion_query(
+        filters={
+            "property": "Date",
+            "date": {"on_or_after": month_start}
+        },
+        sorts=[{"property": "Date", "direction": "descending"}]
+    )
 
-    # Keep only the latest entry per company
     seen = set()
     latest = []
     for page in pages:
@@ -234,55 +318,53 @@ def write_to_notion(data):
 
     alert_reason_text = " | ".join(alert_reasons) if alert_reasons else ""
 
-    try:
-        notion.pages.create(
-            parent={"database_id": NOTION_DATABASE_ID},
-            properties={
-                "Company": {
-                    "title": [{"text": {"content": company}}]
-                },
-                "Founder": {
-                    "rich_text": [{"text": {"content": founder}}]
-                },
-                "Date": {
-                    "date": {"start": datetime.now().strftime("%Y-%m-%d")}
-                },
-                "MRR (€)": {
-                    "number": mrr
-                },
-                "Previous MRR (€)": {
-                    "number": previous_mrr if previous_mrr is not None else 0
-                },
-                "Runway (months)": {
-                    "number": runway
-                },
-                "Headcount": {
-                    "number": headcount
-                },
-                "Biggest Win": {
-                    "rich_text": [{"text": {"content": biggest_win}}]
-                },
-                "Biggest Blocker": {
-                    "rich_text": [{"text": {"content": biggest_blocker}}]
-                },
-                "Help Needed": {
-                    "rich_text": [{"text": {"content": help_needed}}]
-                },
-                "Alert": {
-                    "checkbox": alert
-                },
-                "Alert Reason": {
-                    "rich_text": [{"text": {"content": alert_reason_text}}]
-                },
-                "Responded": {
-                    "checkbox": True
-                }
-            }
-        )
+    properties = {
+        "Company": {
+            "title": [{"text": {"content": company}}]
+        },
+        "Founder": {
+            "rich_text": [{"text": {"content": founder}}]
+        },
+        "Date": {
+            "date": {"start": datetime.now().strftime("%Y-%m-%d")}
+        },
+        "MRR (€)": {
+            "number": mrr
+        },
+        "Previous MRR (€)": {
+            "number": previous_mrr if previous_mrr is not None else 0
+        },
+        "Runway (months)": {
+            "number": runway
+        },
+        "Headcount": {
+            "number": headcount
+        },
+        "Biggest Win": {
+            "rich_text": [{"text": {"content": biggest_win}}]
+        },
+        "Biggest Blocker": {
+            "rich_text": [{"text": {"content": biggest_blocker}}]
+        },
+        "Help Needed": {
+            "rich_text": [{"text": {"content": help_needed}}]
+        },
+        "Alert": {
+            "checkbox": alert
+        },
+        "Alert Reason": {
+            "rich_text": [{"text": {"content": alert_reason_text}}]
+        },
+        "Responded": {
+            "checkbox": True
+        }
+    }
+
+    success = notion_create_page(properties)
+    if success:
         print(f"[DEBUG] Notion row created for {company}")
         return alert, alert_reasons
-    except Exception as e:
-        print(f"[ERROR] Failed to write to Notion: {e}")
+    else:
         return False, []
 
 # =========================
@@ -299,10 +381,7 @@ def send_alert(company, founder, alert_reasons):
         f"Check the Notion dashboard for full details."
     )
     try:
-        bot_client.chat_postMessage(
-            channel=ALERT_SLACK_CHANNEL,
-            text=message
-        )
+        bot_client.chat_postMessage(channel=ALERT_SLACK_CHANNEL, text=message)
         print(f"[DEBUG] Alert sent for {company}")
     except Exception as e:
         print(f"[ERROR] Failed to send alert: {e}")
@@ -467,7 +546,6 @@ def send_weekly_digest():
         day=1, hour=0, minute=0, second=0, microsecond=0
     ).strftime("%Y-%m-%d")
 
-    # Get only the latest entry per company this month
     pages = get_latest_entry_per_company(month_start)
 
     if not pages:
@@ -515,7 +593,6 @@ def send_weekly_digest():
         if alert:
             alerts.append(f"• 🚨 *{company}* — {alert_reason}")
 
-    # Figure out who hasn't responded yet
     all_companies = set(startups["startup_name"].tolist())
     pending_companies = all_companies - responded_companies
     total_startups = len(all_companies)
@@ -581,8 +658,6 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
     source = "USER" if client_type == "user" else "BOT"
     template = message_template or DEFAULT_MESSAGE_TEMPLATE
 
-    print(f"[DEBUG] Sending as {source} with template: {template}")
-
     for _, row in startups.iterrows():
         slack_id = str(row.get("slack_user_id", ""))
         if not slack_id or slack_id == "nan":
@@ -615,10 +690,7 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
         print(f"Could not notify admin: {e}")
 
     try:
-        bot_client.views_publish(
-            user_id=user_id,
-            view=build_admin_home_view()
-        )
+        bot_client.views_publish(user_id=user_id, view=build_admin_home_view())
     except Exception as e:
         print(f"Failed to refresh Home tab post-send: {e}")
 
@@ -675,21 +747,12 @@ def send_messages():
     user_id = request.form.get("user_id")
 
     if user_id != ADMIN_USER_ID:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": "You are not allowed to use this command."
-        }), 200
+        return jsonify({"response_type": "ephemeral", "text": "You are not allowed to use this command."}), 200
 
-    thread = threading.Thread(
+    threading.Thread(
         target=process_messages,
-        args=(
-            user_id,
-            "user",
-            admin_session["selected_startup_ids"],
-            admin_session["message_template"]
-        )
-    )
-    thread.start()
+        args=(user_id, "user", admin_session["selected_startup_ids"], admin_session["message_template"])
+    ).start()
 
     return jsonify({
         "response_type": "ephemeral",
@@ -702,10 +765,7 @@ def trigger_health_check_slash():
     user_id = request.form.get("user_id")
 
     if user_id != ADMIN_USER_ID:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": "You are not allowed to use this command."
-        }), 200
+        return jsonify({"response_type": "ephemeral", "text": "You are not allowed to use this command."}), 200
 
     threading.Thread(target=send_health_check_pings, args=(user_id,)).start()
 
@@ -720,10 +780,7 @@ def trigger_digest_slash():
     user_id = request.form.get("user_id")
 
     if user_id != ADMIN_USER_ID:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": "You are not allowed to use this command."
-        }), 200
+        return jsonify({"response_type": "ephemeral", "text": "You are not allowed to use this command."}), 200
 
     threading.Thread(target=send_weekly_digest).start()
 
@@ -782,10 +839,7 @@ def build_admin_home_view():
                     "style": "danger",
                     "confirm": {
                         "title": {"type": "plain_text", "text": "Cancel scheduled send?"},
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": "This will cancel the upcoming scheduled send. No messages will be sent."
-                        },
+                        "text": {"type": "mrkdwn", "text": "This will cancel the upcoming scheduled send."},
                         "confirm": {"type": "plain_text", "text": "Yes, cancel it"},
                         "deny": {"type": "plain_text", "text": "Keep it"}
                     }
@@ -797,17 +851,8 @@ def build_admin_home_view():
     return {
         "type": "home",
         "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "UnicornFactory", "emoji": False}
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "Outreach that hits different. Select your founders, craft your message, blast it out."
-                }
-            },
+            {"type": "header", "text": {"type": "plain_text", "text": "UnicornFactory", "emoji": False}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Outreach that hits different. Select your founders, craft your message, blast it out."}},
             {"type": "divider"},
             *scheduled_status_blocks,
             {
@@ -820,17 +865,8 @@ def build_admin_home_view():
                 ]
             },
             {"type": "divider"},
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Who's getting this?", "emoji": False}
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "Uncheck anyone you want to skip. Everyone else gets the message."
-                }
-            },
+            {"type": "header", "text": {"type": "plain_text", "text": "Who's getting this?", "emoji": False}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Uncheck anyone you want to skip. Everyone else gets the message."}},
             {
                 "type": "actions",
                 "elements": [
@@ -843,10 +879,7 @@ def build_admin_home_view():
                 ]
             },
             {"type": "divider"},
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "The message", "emoji": False}
-            },
+            {"type": "header", "text": {"type": "plain_text", "text": "The message", "emoji": False}},
             {
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": f"_{current_template}_"},
@@ -859,26 +892,13 @@ def build_admin_home_view():
             },
             {
                 "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": "Live preview  —  " + current_template.format(
-                            founder_name="Maria", startup_name="Acme"
-                        )
-                    }
-                ]
+                "elements": [{"type": "mrkdwn", "text": "Live preview  —  " + current_template.format(founder_name="Maria", startup_name="Acme")}]
             },
             {"type": "divider"},
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Ready to launch?", "emoji": False}
-            },
+            {"type": "header", "text": {"type": "plain_text", "text": "Ready to launch?", "emoji": False}},
             {
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"You're about to reach *{selected_count} founder(s)*. You'll get a DM the moment it's done."
-                }
+                "text": {"type": "mrkdwn", "text": f"You're about to reach *{selected_count} founder(s)*. You'll get a DM the moment it's done."}
             },
             {
                 "type": "actions",
@@ -890,38 +910,18 @@ def build_admin_home_view():
                         "action_id": "send_messages_button",
                         "confirm": {
                             "title": {"type": "plain_text", "text": "Launch outreach?"},
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": f"This sends your message to *{selected_count} founder(s)* right now. No take-backs."
-                            },
+                            "text": {"type": "mrkdwn", "text": f"This sends your message to *{selected_count} founder(s)* right now. No take-backs."},
                             "confirm": {"type": "plain_text", "text": "Let's go"},
                             "deny": {"type": "plain_text", "text": "Not yet"}
                         }
                     },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Schedule Send", "emoji": False},
-                        "action_id": "open_schedule_modal"
-                    },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Reset everything", "emoji": False},
-                        "action_id": "reset_defaults_button"
-                    }
+                    {"type": "button", "text": {"type": "plain_text", "text": "Schedule Send", "emoji": False}, "action_id": "open_schedule_modal"},
+                    {"type": "button", "text": {"type": "plain_text", "text": "Reset everything", "emoji": False}, "action_id": "reset_defaults_button"}
                 ]
             },
             {"type": "divider"},
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "Portfolio Health Checks", "emoji": False}
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "Ping all founders with the monthly health check form, or generate the portfolio digest on demand."
-                }
-            },
+            {"type": "header", "text": {"type": "plain_text", "text": "Portfolio Health Checks", "emoji": False}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Ping all founders with the monthly health check form, or generate the portfolio digest on demand."}},
             {
                 "type": "actions",
                 "elements": [
@@ -931,33 +931,17 @@ def build_admin_home_view():
                         "action_id": "send_health_check_button",
                         "confirm": {
                             "title": {"type": "plain_text", "text": "Send health check pings?"},
-                            "text": {
-                                "type": "mrkdwn",
-                                "text": "This will DM every founder in your roster with the monthly health check form link."
-                            },
+                            "text": {"type": "mrkdwn", "text": "This will DM every founder in your roster with the monthly health check form link."},
                             "confirm": {"type": "plain_text", "text": "Send it"},
                             "deny": {"type": "plain_text", "text": "Not yet"}
                         }
                     },
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Generate Digest", "emoji": False},
-                        "action_id": "send_digest_button"
-                    }
+                    {"type": "button", "text": {"type": "plain_text", "text": "Generate Digest", "emoji": False}, "action_id": "send_digest_button"}
                 ]
             },
             {
                 "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": (
-                            "Health checks go out automatically on the 1st of each month. "
-                            "Digest posts every Monday at 08:00. "
-                            "Use `/healthcheck` or `/digest` from any channel too."
-                        )
-                    }
-                ]
+                "elements": [{"type": "mrkdwn", "text": "Health checks go out automatically on the 1st of each month. Digest posts every Monday at 08:00. Use `/healthcheck` or `/digest` from any channel too."}]
             }
         ]
     }
@@ -975,11 +959,7 @@ def build_message_editor_modal():
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        "*Make it yours.*\n"
-                        "Use `{founder_name}` and `{startup_name}` as dynamic placeholders — "
-                        "they'll be swapped out for each founder automatically."
-                    )
+                    "text": "*Make it yours.*\nUse `{founder_name}` and `{startup_name}` as dynamic placeholders."
                 }
             },
             {"type": "divider"},
@@ -994,11 +974,7 @@ def build_message_editor_modal():
                     "placeholder": {"type": "plain_text", "text": "Write something worth reading..."}
                 },
                 "label": {"type": "plain_text", "text": "Message body", "emoji": False},
-                "hint": {
-                    "type": "plain_text",
-                    "text": "Click Save when you're happy with it. The Home tab will update with a live preview.",
-                    "emoji": False
-                }
+                "hint": {"type": "plain_text", "text": "Click Save when you're happy with it.", "emoji": False}
             }
         ]
     }
@@ -1007,9 +983,7 @@ def build_message_editor_modal():
 def build_schedule_modal():
     tz_label = admin_session.get("timezone", "Europe/Lisbon")
     tz = pytz.timezone(tz_label)
-    tomorrow_local = (datetime.now(tz) + timedelta(days=1)).replace(
-        hour=9, minute=0, second=0, microsecond=0
-    )
+    tomorrow_local = (datetime.now(tz) + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
 
     return {
         "type": "modal",
@@ -1018,13 +992,7 @@ def build_schedule_modal():
         "submit": {"type": "plain_text", "text": "Schedule", "emoji": False},
         "close": {"type": "plain_text", "text": "Cancel", "emoji": False},
         "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*Pick a date and time* ({tz_label}).\nThe outreach will fire automatically at the moment you choose."
-                }
-            },
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Pick a date and time* ({tz_label})."}},
             {"type": "divider"},
             {
                 "type": "input",
@@ -1055,14 +1023,10 @@ def build_schedule_modal():
                     "type": "plain_text_input",
                     "action_id": "schedule_tz",
                     "initial_value": tz_label,
-                    "placeholder": {"type": "plain_text", "text": "e.g. Europe/Lisbon, America/New_York"}
+                    "placeholder": {"type": "plain_text", "text": "e.g. Europe/Lisbon"}
                 },
                 "label": {"type": "plain_text", "text": "Timezone (IANA format)", "emoji": False},
-                "hint": {
-                    "type": "plain_text",
-                    "text": "Enter a valid IANA timezone name. Your last used timezone is pre-filled.",
-                    "emoji": False
-                }
+                "hint": {"type": "plain_text", "text": "Your last used timezone is pre-filled.", "emoji": False}
             }
         ]
     }
@@ -1072,28 +1036,11 @@ def build_guest_home_view():
     return {
         "type": "home",
         "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "UnicornFactory", "emoji": False}
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": "Outreach that hits different."}
-            },
+            {"type": "header", "text": {"type": "plain_text", "text": "UnicornFactory", "emoji": False}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Outreach that hits different."}},
             {"type": "divider"},
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*This area is admin-only.*\nYou don't have access to the outreach dashboard. If you think that's a mistake, ping your admin."
-                }
-            },
-            {
-                "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": "UnicornFactory Outreach Bot  ·  Admin access required"}
-                ]
-            }
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*This area is admin-only.*\nYou don't have access to the outreach dashboard. If you think that's a mistake, ping your admin."}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "UnicornFactory Outreach Bot  ·  Admin access required"}]}
         ]
     }
 
@@ -1139,13 +1086,9 @@ def slack_interactions():
                 payload.get("view", {}).get("state", {}).get("values", {})
                 .get("message_editor_block", {}).get("message_editor", {}).get("value", "") or ""
             ).strip()
-
             if new_text:
                 admin_session["message_template"] = new_text
-
-            threading.Thread(target=lambda: bot_client.views_publish(
-                user_id=user_id, view=build_admin_home_view()
-            )).start()
+            threading.Thread(target=lambda: bot_client.views_publish(user_id=user_id, view=build_admin_home_view())).start()
             return "", 200
 
         if callback_id == "schedule_modal":
@@ -1157,10 +1100,7 @@ def slack_interactions():
             try:
                 tz = pytz.timezone(tz_str)
             except pytz.exceptions.UnknownTimeZoneError:
-                return jsonify({
-                    "response_action": "errors",
-                    "errors": {"schedule_tz_block": f"'{tz_str}' is not a valid IANA timezone."}
-                }), 200
+                return jsonify({"response_action": "errors", "errors": {"schedule_tz_block": f"'{tz_str}' is not a valid IANA timezone."}}), 200
 
             try:
                 local_dt = tz.localize(datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M"))
@@ -1170,16 +1110,11 @@ def slack_interactions():
                 return "", 200
 
             if utc_dt <= datetime.now(pytz.utc):
-                return jsonify({
-                    "response_action": "errors",
-                    "errors": {"schedule_date_block": "The scheduled time must be in the future."}
-                }), 200
+                return jsonify({"response_action": "errors", "errors": {"schedule_date_block": "The scheduled time must be in the future."}}), 200
 
             admin_session["timezone"] = tz_str
             schedule_messages(
-                user_id=user_id,
-                scheduled_dt_utc=utc_dt,
-                client_type="bot",
+                user_id=user_id, scheduled_dt_utc=utc_dt, client_type="bot",
                 selected_ids=admin_session["selected_startup_ids"],
                 message_template=admin_session["message_template"]
             )
@@ -1192,9 +1127,7 @@ def slack_interactions():
             except Exception as e:
                 print(f"Could not send schedule confirmation: {e}")
 
-            threading.Thread(target=lambda: bot_client.views_publish(
-                user_id=user_id, view=build_admin_home_view()
-            )).start()
+            threading.Thread(target=lambda: bot_client.views_publish(user_id=user_id, view=build_admin_home_view())).start()
             return "", 200
 
     if payload_type == "block_actions":
@@ -1206,20 +1139,14 @@ def slack_interactions():
 
         if action_id == "open_message_editor":
             try:
-                bot_client.views_open(
-                    trigger_id=payload["trigger_id"],
-                    view=build_message_editor_modal()
-                )
+                bot_client.views_open(trigger_id=payload["trigger_id"], view=build_message_editor_modal())
             except Exception as e:
                 print(f"Failed to open modal: {e}")
             return "", 200
 
         if action_id == "open_schedule_modal":
             try:
-                bot_client.views_open(
-                    trigger_id=payload["trigger_id"],
-                    view=build_schedule_modal()
-                )
+                bot_client.views_open(trigger_id=payload["trigger_id"], view=build_schedule_modal())
             except Exception as e:
                 print(f"Failed to open schedule modal: {e}")
             return "", 200
@@ -1229,24 +1156,19 @@ def slack_interactions():
             admin_session["selected_startup_ids"] = (
                 {opt["value"] for opt in selected} if selected else set()
             )
-
         elif action_id == "send_messages_button":
             threading.Thread(
                 target=process_messages,
                 args=(user_id, "bot", admin_session["selected_startup_ids"], admin_session["message_template"])
             ).start()
-
         elif action_id == "cancel_schedule_button":
             cancel_scheduled_send(notify=True)
-
         elif action_id == "reset_defaults_button":
             cancel_scheduled_send(notify=False)
             admin_session["selected_startup_ids"] = None
             admin_session["message_template"] = DEFAULT_MESSAGE_TEMPLATE
-
         elif action_id == "send_health_check_button":
             threading.Thread(target=send_health_check_pings, args=(user_id,)).start()
-
         elif action_id == "send_digest_button":
             threading.Thread(target=send_weekly_digest).start()
 
