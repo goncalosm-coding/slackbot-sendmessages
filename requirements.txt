@@ -5,3 +5,4 @@ pytz
 gunicorn
 notion-client
 requests
+openai

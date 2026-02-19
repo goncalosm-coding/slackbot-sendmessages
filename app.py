@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import pytz
 from notion_client import Client as NotionClient
 import requests
+import openai
 
 app = Flask(__name__)
 
@@ -39,6 +40,12 @@ if not TYPEFORM_WEBHOOK_SECRET:
 ALERT_SLACK_CHANNEL = os.environ.get("ALERT_SLACK_CHANNEL")
 if not ALERT_SLACK_CHANNEL:
     raise ValueError("ALERT_SLACK_CHANNEL environment variable not set!")
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable not set!")
+
+openai.api_key = OPENAI_API_KEY
 
 user_client = WebClient(token=USER_TOKEN)
 bot_client = WebClient(token=BOT_TOKEN)
@@ -82,8 +89,47 @@ admin_session = {
 # ALERT THRESHOLDS
 # =========================
 
-RUNWAY_ALERT_THRESHOLD = 6      # months
-MRR_DROP_ALERT = True           # alert if MRR dropped vs previous month
+RUNWAY_ALERT_THRESHOLD = 6
+MRR_DROP_ALERT = True
+
+# =========================
+# AI COMPANY MATCHING
+# =========================
+
+def match_company_with_ai(raw_name):
+    """Use AI to match a typed company name to the closest one in the CSV."""
+    company_list = startups["startup_name"].tolist()
+    companies_str = "\n".join(company_list)
+
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a company name matcher. Given a name typed by a user "
+                        "and a list of known company names, return the single best match "
+                        "from the list. Return ONLY the exact company name from the list, "
+                        "nothing else. If there is no reasonable match, return 'Unknown'."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Typed name: {raw_name}\n\n"
+                        f"Known companies:\n{companies_str}"
+                    )
+                }
+            ],
+            temperature=0
+        )
+        matched = response.choices[0].message.content.strip()
+        print(f"[DEBUG] AI matched '{raw_name}' → '{matched}'")
+        return matched if matched != "Unknown" else None
+    except Exception as e:
+        print(f"[ERROR] AI matching failed: {e}")
+        return None
 
 # =========================
 # NOTION HELPERS
@@ -93,20 +139,22 @@ def get_previous_mrr(company_name):
     """Fetch the most recent MRR entry for a company from Notion."""
     try:
         results = notion.databases.query(
-            database_id=NOTION_DATABASE_ID,
-            filter={
-                "property": "Company",
-                "title": {
-                    "equals": company_name
-                }
-            },
-            sorts=[
-                {
-                    "property": "Date",
-                    "direction": "descending"
-                }
-            ],
-            page_size=1
+            **{
+                "database_id": NOTION_DATABASE_ID,
+                "filter": {
+                    "property": "Company",
+                    "title": {
+                        "equals": company_name
+                    }
+                },
+                "sorts": [
+                    {
+                        "property": "Date",
+                        "direction": "descending"
+                    }
+                ],
+                "page_size": 1
+            }
         )
         pages = results.get("results", [])
         if not pages:
@@ -132,7 +180,6 @@ def write_to_notion(data):
 
     previous_mrr = get_previous_mrr(company)
 
-    # Determine alerts
     alert = False
     alert_reasons = []
 
@@ -144,7 +191,7 @@ def write_to_notion(data):
         alert = True
         alert_reasons.append(f"MRR dropped from €{previous_mrr:,.0f} to €{mrr:,.0f}")
 
-    if help_needed and help_needed.strip():
+    if help_needed and help_needed.strip().lower() not in ["no", "não", "nao", "n/a", "-", ""]:
         alert = True
         alert_reasons.append(f"Founder requested help: {help_needed}")
 
@@ -201,7 +248,6 @@ def write_to_notion(data):
         print(f"[ERROR] Failed to write to Notion: {e}")
         return False, []
 
-
 # =========================
 # ALERT HELPERS
 # =========================
@@ -223,7 +269,6 @@ def send_alert(company, founder, alert_reasons):
         print(f"[DEBUG] Alert sent for {company}")
     except Exception as e:
         print(f"[ERROR] Failed to send alert: {e}")
-
 
 # =========================
 # TYPEFORM WEBHOOK
@@ -253,7 +298,7 @@ def parse_typeform_response(payload):
             data["mrr"] = float(value) if value else 0
         elif "runway" in field_title:
             data["runway"] = float(value) if value else 0
-        elif "headcount" in field_title or "team" in field_title:
+        elif "headcount" in field_title or "team" in field_title or "people" in field_title:
             data["headcount"] = int(value) if value else 0
         elif "win" in field_title:
             data["biggest_win"] = value or ""
@@ -262,11 +307,17 @@ def parse_typeform_response(payload):
         elif "help" in field_title or "unicorn" in field_title:
             data["help_needed"] = value or ""
 
-    # Try to match founder name from CSV using company name
-    company_name = data.get("company", "")
-    match = startups[startups["startup_name"].str.lower() == company_name.lower()]
-    if not match.empty:
-        data["founder"] = match.iloc[0]["founder_name"]
+    # AI-powered company matching
+    raw_company = data.get("company", "")
+    matched_company = match_company_with_ai(raw_company) if raw_company else None
+
+    if matched_company:
+        data["company"] = matched_company
+        match = startups[startups["startup_name"] == matched_company]
+        if not match.empty:
+            data["founder"] = match.iloc[0]["founder_name"]
+        else:
+            data["founder"] = "Unknown"
     else:
         data["founder"] = "Unknown"
 
@@ -275,7 +326,6 @@ def parse_typeform_response(payload):
 
 @app.route("/typeform/webhook", methods=["POST"])
 def typeform_webhook():
-    # Verify the secret
     secret = request.args.get("secret", "")
     if secret != TYPEFORM_WEBHOOK_SECRET:
         print("[WARN] Unauthorized webhook attempt")
@@ -288,15 +338,12 @@ def typeform_webhook():
     data = parse_typeform_response(payload)
     print(f"[DEBUG] Parsed Typeform response: {data}")
 
-    # Write to Notion and check for alerts
     alert, alert_reasons = write_to_notion(data)
 
-    # Send alert if needed
     if alert:
         send_alert(data.get("company", "Unknown"), data.get("founder", "Unknown"), alert_reasons)
 
     return jsonify({"status": "ok"}), 200
-
 
 # =========================
 # HEALTH CHECK BLAST
@@ -334,26 +381,6 @@ def send_health_check_pings(user_id):
     except Exception as e:
         print(f"[ERROR] Could not notify admin: {e}")
 
-
-@app.route("/healthcheck", methods=["POST"])
-def trigger_health_check():
-    """Slash command to manually trigger health check pings."""
-    user_id = request.form.get("user_id")
-
-    if user_id != ADMIN_USER_ID:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": "You are not allowed to use this command."
-        }), 200
-
-    threading.Thread(target=send_health_check_pings, args=(user_id,)).start()
-
-    return jsonify({
-        "response_type": "ephemeral",
-        "text": "Sending health check pings now. You'll get a DM when it's done."
-    }), 200
-
-
 # =========================
 # MONTHLY CRON SCHEDULER
 # =========================
@@ -364,11 +391,9 @@ def schedule_monthly_health_check():
 
     def next_run_time():
         now = datetime.now(tz)
-        # Next 1st of month at 09:00
         if now.day == 1 and now.hour < 9:
             target = now.replace(hour=9, minute=0, second=0, microsecond=0)
         else:
-            # Roll to next month
             if now.month == 12:
                 target = now.replace(year=now.year + 1, month=1, day=1, hour=9, minute=0, second=0, microsecond=0)
             else:
@@ -387,7 +412,6 @@ def schedule_monthly_health_check():
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
 
-
 # =========================
 # WEEKLY DIGEST
 # =========================
@@ -400,14 +424,16 @@ def send_weekly_digest():
 
     try:
         results = notion.databases.query(
-            database_id=NOTION_DATABASE_ID,
-            filter={
-                "property": "Date",
-                "date": {
-                    "on_or_after": month_start
-                }
-            },
-            sorts=[{"property": "Date", "direction": "descending"}]
+            **{
+                "database_id": NOTION_DATABASE_ID,
+                "filter": {
+                    "property": "Date",
+                    "date": {
+                        "on_or_after": month_start
+                    }
+                },
+                "sorts": [{"property": "Date", "direction": "descending"}]
+            }
         )
         pages = results.get("results", [])
     except Exception as e:
@@ -483,7 +509,6 @@ def schedule_weekly_digest():
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
-
 
 # =========================
 # CORE MESSAGE PROCESSING
@@ -576,7 +601,6 @@ def cancel_scheduled_send(notify=True):
         except Exception as e:
             print(f"Could not notify admin of cancellation: {e}")
 
-
 # =========================
 # ROOT / HEALTH CHECK
 # =========================
@@ -584,7 +608,6 @@ def cancel_scheduled_send(notify=True):
 @app.route("/")
 def home():
     return "UnicornFactory bot is running."
-
 
 # =========================
 # SLASH COMMANDS
@@ -637,7 +660,6 @@ def trigger_health_check_slash():
 
 @app.route("/digest", methods=["POST"])
 def trigger_digest_slash():
-    """Slash command to manually trigger the weekly digest."""
     user_id = request.form.get("user_id")
 
     if user_id != ADMIN_USER_ID:
@@ -652,7 +674,6 @@ def trigger_digest_slash():
         "response_type": "ephemeral",
         "text": "Generating digest now. Check your Slack channel in a moment."
     }), 200
-
 
 # =========================
 # HOME TAB VIEWS
@@ -827,9 +848,7 @@ def build_admin_home_view():
                     }
                 ]
             },
-            {
-                "type": "divider"
-            },
+            {"type": "divider"},
             {
                 "type": "header",
                 "text": {"type": "plain_text", "text": "Portfolio Health Checks", "emoji": False}
@@ -1016,7 +1035,6 @@ def build_guest_home_view():
         ]
     }
 
-
 # =========================
 # SLACK EVENTS
 # =========================
@@ -1037,7 +1055,6 @@ def slack_events():
             print(f"Failed to publish Home tab: {e}")
 
     return "", 200
-
 
 # =========================
 # INTERACTIONS
@@ -1172,15 +1189,13 @@ def slack_interactions():
 
     return "", 200
 
-
 # =========================
-# STARTUP CRON JOBS
+# HELPERS
 # =========================
 
 def startup_count_for_session():
     selected_ids = admin_session["selected_startup_ids"]
     return len(startups) if selected_ids is None else len(selected_ids)
-
 
 # =========================
 # RUN APP
