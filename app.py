@@ -139,22 +139,20 @@ def get_previous_mrr(company_name):
     """Fetch the most recent MRR entry for a company from Notion."""
     try:
         results = notion.databases.query(
-            **{
-                "database_id": NOTION_DATABASE_ID,
-                "filter": {
-                    "property": "Company",
-                    "title": {
-                        "equals": company_name
-                    }
-                },
-                "sorts": [
-                    {
-                        "property": "Date",
-                        "direction": "descending"
-                    }
-                ],
-                "page_size": 1
-            }
+            database_id=NOTION_DATABASE_ID,
+            filter={
+                "property": "Company",
+                "title": {
+                    "equals": company_name
+                }
+            },
+            sorts=[
+                {
+                    "property": "Date",
+                    "direction": "descending"
+                }
+            ],
+            page_size=1
         )
         pages = results.get("results", [])
         if not pages:
@@ -165,6 +163,45 @@ def get_previous_mrr(company_name):
     except Exception as e:
         print(f"[ERROR] Failed to fetch previous MRR for {company_name}: {e}")
         return None
+
+
+def get_latest_entry_per_company(month_start):
+    """
+    Query all responses from this month and return only the
+    most recent entry per company, to avoid duplicates in the digest.
+    """
+    try:
+        results = notion.databases.query(
+            database_id=NOTION_DATABASE_ID,
+            filter={
+                "property": "Date",
+                "date": {
+                    "on_or_after": month_start
+                }
+            },
+            sorts=[{"property": "Date", "direction": "descending"}]
+        )
+        pages = results.get("results", [])
+    except Exception as e:
+        print(f"[ERROR] Failed to query Notion: {e}")
+        return []
+
+    # Keep only the latest entry per company
+    seen = set()
+    latest = []
+    for page in pages:
+        props = page["properties"]
+        company = (
+            props.get("Company", {})
+            .get("title", [{}])[0]
+            .get("text", {})
+            .get("content", "Unknown")
+        )
+        if company not in seen:
+            seen.add(company)
+            latest.append(page)
+
+    return latest
 
 
 def write_to_notion(data):
@@ -395,9 +432,15 @@ def schedule_monthly_health_check():
             target = now.replace(hour=9, minute=0, second=0, microsecond=0)
         else:
             if now.month == 12:
-                target = now.replace(year=now.year + 1, month=1, day=1, hour=9, minute=0, second=0, microsecond=0)
+                target = now.replace(
+                    year=now.year + 1, month=1, day=1,
+                    hour=9, minute=0, second=0, microsecond=0
+                )
             else:
-                target = now.replace(month=now.month + 1, day=1, hour=9, minute=0, second=0, microsecond=0)
+                target = now.replace(
+                    month=now.month + 1, day=1,
+                    hour=9, minute=0, second=0, microsecond=0
+                )
         return target
 
     def run():
@@ -420,52 +463,64 @@ def send_weekly_digest():
     """Query Notion for this month's responses and post a digest to Slack."""
     tz = pytz.timezone("Europe/Lisbon")
     now = datetime.now(tz)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d")
+    month_start = now.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    ).strftime("%Y-%m-%d")
 
-    try:
-        results = notion.databases.query(
-            **{
-                "database_id": NOTION_DATABASE_ID,
-                "filter": {
-                    "property": "Date",
-                    "date": {
-                        "on_or_after": month_start
-                    }
-                },
-                "sorts": [{"property": "Date", "direction": "descending"}]
-            }
-        )
-        pages = results.get("results", [])
-    except Exception as e:
-        print(f"[ERROR] Failed to query Notion for digest: {e}")
-        return
+    # Get only the latest entry per company this month
+    pages = get_latest_entry_per_company(month_start)
 
     if not pages:
-        bot_client.chat_postMessage(
-            channel=ALERT_SLACK_CHANNEL,
-            text="📋 *Weekly Portfolio Digest* — No health check responses received this month yet."
-        )
+        try:
+            bot_client.chat_postMessage(
+                channel=ALERT_SLACK_CHANNEL,
+                text="📋 *Weekly Portfolio Digest* — No health check responses received this month yet."
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to send empty digest: {e}")
         return
 
     responded = []
     alerts = []
+    responded_companies = set()
 
     for page in pages:
         props = page["properties"]
-        company = props.get("Company", {}).get("title", [{}])[0].get("text", {}).get("content", "Unknown")
-        founder = props.get("Founder", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "Unknown")
+        company = (
+            props.get("Company", {})
+            .get("title", [{}])[0]
+            .get("text", {})
+            .get("content", "Unknown")
+        )
+        founder = (
+            props.get("Founder", {})
+            .get("rich_text", [{}])[0]
+            .get("text", {})
+            .get("content", "Unknown")
+        )
         mrr = props.get("MRR (€)", {}).get("number", 0) or 0
         runway = props.get("Runway (months)", {}).get("number", 0) or 0
         alert = props.get("Alert", {}).get("checkbox", False)
-        alert_reason = props.get("Alert Reason", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "")
+        alert_reason = (
+            props.get("Alert Reason", {})
+            .get("rich_text", [{}])[0]
+            .get("text", {})
+            .get("content", "")
+        )
 
-        responded.append(f"• *{company}* ({founder}) — MRR: €{mrr:,.0f} | Runway: {runway}mo")
+        responded_companies.add(company)
+        responded.append(
+            f"• *{company}* ({founder}) — MRR: €{mrr:,.0f} | Runway: {runway}mo"
+        )
         if alert:
             alerts.append(f"• 🚨 *{company}* — {alert_reason}")
 
-    total_startups = len(startups)
-    responded_count = len(pages)
-    missing_count = total_startups - responded_count
+    # Figure out who hasn't responded yet
+    all_companies = set(startups["startup_name"].tolist())
+    pending_companies = all_companies - responded_companies
+    total_startups = len(all_companies)
+    responded_count = len(responded_companies)
+    missing_count = len(pending_companies)
 
     digest = f"📋 *Weekly Portfolio Digest — {now.strftime('%B %Y')}*\n\n"
     digest += f"*{responded_count}/{total_startups} founders have responded* ({missing_count} still pending)\n\n"
@@ -476,8 +531,10 @@ def send_weekly_digest():
     if alerts:
         digest += "*⚠️ Active alerts:*\n" + "\n".join(alerts) + "\n\n"
 
-    if missing_count > 0:
-        digest += f"_Tip: Run `/healthcheck` to re-ping founders who haven't responded yet._"
+    if pending_companies:
+        pending_list = "\n".join([f"• {c}" for c in sorted(pending_companies)])
+        digest += f"*Still waiting on:*\n{pending_list}\n\n"
+        digest += "_Run `/healthcheck` to re-ping founders who haven't responded yet._"
 
     try:
         bot_client.chat_postMessage(channel=ALERT_SLACK_CHANNEL, text=digest)
@@ -602,7 +659,7 @@ def cancel_scheduled_send(notify=True):
             print(f"Could not notify admin of cancellation: {e}")
 
 # =========================
-# ROOT / HEALTH CHECK
+# ROOT
 # =========================
 
 @app.route("/")
@@ -769,7 +826,10 @@ def build_admin_home_view():
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "Uncheck anyone you want to skip. Everyone else gets the message."}
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "Uncheck anyone you want to skip. Everyone else gets the message."
+                }
             },
             {
                 "type": "actions",
@@ -802,7 +862,9 @@ def build_admin_home_view():
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": "Live preview  —  " + current_template.format(founder_name="Maria", startup_name="Acme")
+                        "text": "Live preview  —  " + current_template.format(
+                            founder_name="Maria", startup_name="Acme"
+                        )
                     }
                 ]
             },
@@ -1144,14 +1206,20 @@ def slack_interactions():
 
         if action_id == "open_message_editor":
             try:
-                bot_client.views_open(trigger_id=payload["trigger_id"], view=build_message_editor_modal())
+                bot_client.views_open(
+                    trigger_id=payload["trigger_id"],
+                    view=build_message_editor_modal()
+                )
             except Exception as e:
                 print(f"Failed to open modal: {e}")
             return "", 200
 
         if action_id == "open_schedule_modal":
             try:
-                bot_client.views_open(trigger_id=payload["trigger_id"], view=build_schedule_modal())
+                bot_client.views_open(
+                    trigger_id=payload["trigger_id"],
+                    view=build_schedule_modal()
+                )
             except Exception as e:
                 print(f"Failed to open schedule modal: {e}")
             return "", 200
