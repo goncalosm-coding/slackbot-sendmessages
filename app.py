@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from slack_sdk import WebClient
 import pandas as pd
 import os
@@ -10,6 +10,18 @@ import pytz
 from notion_client import Client as NotionClient
 import requests
 import openai
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import mm
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    HRFlowable, PageBreak
+)
+from reportlab.graphics.shapes import Drawing, Rect
+from reportlab.graphics import renderPDF
+import io
 
 app = Flask(__name__)
 
@@ -44,6 +56,9 @@ if not ALERT_SLACK_CHANNEL:
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable not set!")
+
+REPORT_OUTPUT_PATH = os.environ.get("REPORT_OUTPUT_PATH", "reports")
+os.makedirs(REPORT_OUTPUT_PATH, exist_ok=True)
 
 openai.api_key = OPENAI_API_KEY
 
@@ -93,21 +108,28 @@ RUNWAY_ALERT_THRESHOLD = 6
 MRR_DROP_ALERT = True
 
 # =========================
+# BRAND COLORS
+# =========================
+
+UF_BLACK = colors.HexColor("#0A0A0A")
+UF_WHITE = colors.HexColor("#FFFFFF")
+UF_ACCENT = colors.HexColor("#6C3CF5")       # purple — change to match UF brand
+UF_LIGHT = colors.HexColor("#F4F2FF")
+UF_GRAY = colors.HexColor("#6B7280")
+UF_GREEN = colors.HexColor("#10B981")
+UF_YELLOW = colors.HexColor("#F59E0B")
+UF_RED = colors.HexColor("#EF4444")
+
+# =========================
 # NOTION DATA SOURCE HELPER
 # =========================
 
-# Cache the data_source_id so we only fetch it once per app startup
 _data_source_id_cache = None
 
 def get_data_source_id():
-    """
-    Fetch and cache the data_source_id for our database.
-    Required by Notion API version 2025-09-03.
-    """
     global _data_source_id_cache
     if _data_source_id_cache:
         return _data_source_id_cache
-
     try:
         response = requests.get(
             f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}",
@@ -129,14 +151,9 @@ def get_data_source_id():
 
 
 def notion_query(filters=None, sorts=None, page_size=100):
-    """
-    Query the Notion data source using the new 2025-09-03 API endpoint.
-    """
     data_source_id = get_data_source_id()
     if not data_source_id:
-        print("[ERROR] Cannot query — no data_source_id available.")
         return []
-
     body = {}
     if filters:
         body["filter"] = filters
@@ -144,7 +161,6 @@ def notion_query(filters=None, sorts=None, page_size=100):
         body["sorts"] = sorts
     if page_size:
         body["page_size"] = page_size
-
     try:
         response = requests.post(
             f"https://api.notion.com/v1/data_sources/{data_source_id}/query",
@@ -155,23 +171,16 @@ def notion_query(filters=None, sorts=None, page_size=100):
             },
             json=body
         )
-        result = response.json()
-        return result.get("results", [])
+        return response.json().get("results", [])
     except Exception as e:
         print(f"[ERROR] Notion query failed: {e}")
         return []
 
 
 def notion_create_page(properties):
-    """
-    Create a page in the Notion data source using the new 2025-09-03 API.
-    Uses data_source_id as parent instead of database_id.
-    """
     data_source_id = get_data_source_id()
     if not data_source_id:
-        print("[ERROR] Cannot create page — no data_source_id available.")
         return False
-
     try:
         response = requests.post(
             "https://api.notion.com/v1/pages",
@@ -190,9 +199,8 @@ def notion_create_page(properties):
         )
         if response.status_code == 200:
             return True
-        else:
-            print(f"[ERROR] Notion page creation failed: {response.text}")
-            return False
+        print(f"[ERROR] Notion page creation failed: {response.text}")
+        return False
     except Exception as e:
         print(f"[ERROR] Notion page creation exception: {e}")
         return False
@@ -202,10 +210,8 @@ def notion_create_page(properties):
 # =========================
 
 def match_company_with_ai(raw_name):
-    """Use AI to match a typed company name to the closest one in the CSV."""
     company_list = startups["startup_name"].tolist()
     companies_str = "\n".join(company_list)
-
     try:
         response = openai.chat.completions.create(
             model="gpt-4o-mini",
@@ -223,10 +229,7 @@ def match_company_with_ai(raw_name):
                 },
                 {
                     "role": "user",
-                    "content": (
-                        f"Typed name: {raw_name}\n\n"
-                        f"Known companies:\n{companies_str}"
-                    )
+                    "content": f"Typed name: {raw_name}\n\nKnown companies:\n{companies_str}"
                 }
             ],
             temperature=0
@@ -243,34 +246,21 @@ def match_company_with_ai(raw_name):
 # =========================
 
 def get_previous_mrr(company_name):
-    """Fetch the most recent MRR entry for a company from Notion."""
     pages = notion_query(
-        filters={
-            "property": "Company",
-            "title": {"equals": company_name}
-        },
+        filters={"property": "Company", "title": {"equals": company_name}},
         sorts=[{"property": "Date", "direction": "descending"}],
         page_size=1
     )
     if not pages:
         return None
-    props = pages[0]["properties"]
-    return props.get("MRR (€)", {}).get("number", None)
+    return pages[0]["properties"].get("MRR (€)", {}).get("number", None)
 
 
 def get_latest_entry_per_company(month_start):
-    """
-    Query all responses from this month and return only the
-    most recent entry per company, to avoid duplicates in the digest.
-    """
     pages = notion_query(
-        filters={
-            "property": "Date",
-            "date": {"on_or_after": month_start}
-        },
+        filters={"property": "Date", "date": {"on_or_after": month_start}},
         sorts=[{"property": "Date", "direction": "descending"}]
     )
-
     seen = set()
     latest = []
     for page in pages:
@@ -284,12 +274,10 @@ def get_latest_entry_per_company(month_start):
         if company not in seen:
             seen.add(company)
             latest.append(page)
-
     return latest
 
 
 def write_to_notion(data):
-    """Write a health check response to the Notion database."""
     company = data.get("company", "Unknown")
     founder = data.get("founder", "Unknown")
     mrr = data.get("mrr", 0)
@@ -319,60 +307,32 @@ def write_to_notion(data):
     alert_reason_text = " | ".join(alert_reasons) if alert_reasons else ""
 
     properties = {
-        "Company": {
-            "title": [{"text": {"content": company}}]
-        },
-        "Founder": {
-            "rich_text": [{"text": {"content": founder}}]
-        },
-        "Date": {
-            "date": {"start": datetime.now().strftime("%Y-%m-%d")}
-        },
-        "MRR (€)": {
-            "number": mrr
-        },
-        "Previous MRR (€)": {
-            "number": previous_mrr if previous_mrr is not None else 0
-        },
-        "Runway (months)": {
-            "number": runway
-        },
-        "Headcount": {
-            "number": headcount
-        },
-        "Biggest Win": {
-            "rich_text": [{"text": {"content": biggest_win}}]
-        },
-        "Biggest Blocker": {
-            "rich_text": [{"text": {"content": biggest_blocker}}]
-        },
-        "Help Needed": {
-            "rich_text": [{"text": {"content": help_needed}}]
-        },
-        "Alert": {
-            "checkbox": alert
-        },
-        "Alert Reason": {
-            "rich_text": [{"text": {"content": alert_reason_text}}]
-        },
-        "Responded": {
-            "checkbox": True
-        }
+        "Company": {"title": [{"text": {"content": company}}]},
+        "Founder": {"rich_text": [{"text": {"content": founder}}]},
+        "Date": {"date": {"start": datetime.now().strftime("%Y-%m-%d")}},
+        "MRR (€)": {"number": mrr},
+        "Previous MRR (€)": {"number": previous_mrr if previous_mrr is not None else 0},
+        "Runway (months)": {"number": runway},
+        "Headcount": {"number": headcount},
+        "Biggest Win": {"rich_text": [{"text": {"content": biggest_win}}]},
+        "Biggest Blocker": {"rich_text": [{"text": {"content": biggest_blocker}}]},
+        "Help Needed": {"rich_text": [{"text": {"content": help_needed}}]},
+        "Alert": {"checkbox": alert},
+        "Alert Reason": {"rich_text": [{"text": {"content": alert_reason_text}}]},
+        "Responded": {"checkbox": True}
     }
 
     success = notion_create_page(properties)
     if success:
         print(f"[DEBUG] Notion row created for {company}")
         return alert, alert_reasons
-    else:
-        return False, []
+    return False, []
 
 # =========================
 # ALERT HELPERS
 # =========================
 
 def send_alert(company, founder, alert_reasons):
-    """Send a Slack alert to the admin channel."""
     reasons_text = "\n".join([f"• {r}" for r in alert_reasons])
     message = (
         f"🚨 *Health Check Alert — {company}*\n"
@@ -387,11 +347,518 @@ def send_alert(company, founder, alert_reasons):
         print(f"[ERROR] Failed to send alert: {e}")
 
 # =========================
+# PDF REPORT GENERATOR
+# =========================
+
+def get_status_indicator(runway, mrr, previous_mrr, help_needed):
+    """Return a status string based on company health."""
+    if runway < 3:
+        return "🔴 Critical"
+    if runway < 6:
+        return "🟡 Watch"
+    if previous_mrr and mrr < previous_mrr:
+        return "🟡 Watch"
+    if help_needed and help_needed.strip().lower() not in ["no", "não", "nao", "n/a", "-", ""]:
+        return "🟡 Watch"
+    return "🟢 Healthy"
+
+
+def generate_ai_narrative(portfolio_data, month_str, total_mrr, avg_runway, total_headcount, pending_companies):
+    """Use GPT-4o to write the executive summary narrative."""
+    companies_summary = ""
+    for d in portfolio_data:
+        companies_summary += (
+            f"- {d['company']} (Founder: {d['founder']}): "
+            f"MRR €{d['mrr']:,.0f}, Runway {d['runway']} months, "
+            f"Headcount {d['headcount']}, "
+            f"Win: {d['biggest_win']}, "
+            f"Blocker: {d['biggest_blocker']}, "
+            f"Status: {d['status']}\n"
+        )
+
+    pending_str = ", ".join(pending_companies) if pending_companies else "None"
+
+    prompt = f"""You are writing the executive summary for Unicorn Factory Lisboa's monthly investor update for {month_str}.
+
+Portfolio data:
+{companies_summary}
+
+Aggregate metrics:
+- Combined portfolio MRR: €{total_mrr:,.0f}
+- Average runway: {avg_runway:.1f} months
+- Total headcount across portfolio: {total_headcount}
+- Companies yet to report: {pending_str}
+
+Write a professional, confident, and honest 3-paragraph executive summary for investors. 
+Paragraph 1: Overall portfolio health and momentum this month.
+Paragraph 2: Standout wins and concerning signals, named specifically.
+Paragraph 3: How Unicorn Factory Lisboa is actively supporting the portfolio and what to expect next month.
+
+Tone: warm but professional, like a top European VC fund. Do not use bullet points. Do not be overly positive — be candid about challenges while remaining constructive. Keep it under 250 words."""
+
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are an expert VC fund manager writing investor updates."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[ERROR] GPT narrative generation failed: {e}")
+        return "Executive summary unavailable this month."
+
+
+def build_pdf_report(month_str, portfolio_data, pending_companies):
+    """Generate the full investor update PDF and return the file path."""
+
+    tz = pytz.timezone("Europe/Lisbon")
+    now = datetime.now(tz)
+    filename = f"UnicornFactory_InvestorUpdate_{now.strftime('%Y_%m')}.pdf"
+    filepath = os.path.join(REPORT_OUTPUT_PATH, filename)
+
+    # Aggregate metrics
+    total_mrr = sum(d["mrr"] for d in portfolio_data)
+    avg_runway = sum(d["runway"] for d in portfolio_data) / len(portfolio_data) if portfolio_data else 0
+    total_headcount = sum(d["headcount"] for d in portfolio_data)
+    total_companies = len(startups)
+    responded_count = len(portfolio_data)
+
+    # Generate AI narrative
+    narrative = generate_ai_narrative(
+        portfolio_data, month_str, total_mrr,
+        avg_runway, total_headcount, pending_companies
+    )
+
+    # ── Document setup ──────────────────────────────────────────────
+    doc = SimpleDocTemplate(
+        filepath,
+        pagesize=A4,
+        leftMargin=20*mm,
+        rightMargin=20*mm,
+        topMargin=20*mm,
+        bottomMargin=20*mm
+    )
+
+    W = A4[0] - 40*mm  # usable width
+
+    # ── Styles ──────────────────────────────────────────────────────
+    styles = getSampleStyleSheet()
+
+    style_cover_title = ParagraphStyle(
+        "CoverTitle",
+        fontName="Helvetica-Bold",
+        fontSize=32,
+        leading=38,
+        textColor=UF_WHITE,
+        alignment=TA_LEFT,
+        spaceAfter=4*mm
+    )
+    style_cover_sub = ParagraphStyle(
+        "CoverSub",
+        fontName="Helvetica",
+        fontSize=14,
+        textColor=colors.HexColor("#CCBBFF"),
+        alignment=TA_LEFT,
+        spaceAfter=2*mm
+    )
+    style_cover_date = ParagraphStyle(
+        "CoverDate",
+        fontName="Helvetica",
+        fontSize=11,
+        textColor=colors.HexColor("#999999"),
+        alignment=TA_LEFT,
+    )
+    style_section_header = ParagraphStyle(
+        "SectionHeader",
+        fontName="Helvetica-Bold",
+        fontSize=16,
+        textColor=UF_BLACK,
+        spaceBefore=6*mm,
+        spaceAfter=3*mm
+    )
+    style_body = ParagraphStyle(
+        "Body",
+        fontName="Helvetica",
+        fontSize=10,
+        leading=16,
+        textColor=colors.HexColor("#374151"),
+        spaceAfter=3*mm
+    )
+    style_company_name = ParagraphStyle(
+        "CompanyName",
+        fontName="Helvetica-Bold",
+        fontSize=13,
+        textColor=UF_BLACK,
+        spaceAfter=1*mm
+    )
+    style_label = ParagraphStyle(
+        "Label",
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        textColor=UF_GRAY,
+        spaceAfter=0
+    )
+    style_value = ParagraphStyle(
+        "Value",
+        fontName="Helvetica",
+        fontSize=10,
+        textColor=UF_BLACK,
+        spaceAfter=2*mm
+    )
+    style_small = ParagraphStyle(
+        "Small",
+        fontName="Helvetica",
+        fontSize=8,
+        textColor=UF_GRAY,
+        spaceAfter=1*mm
+    )
+    style_footer = ParagraphStyle(
+        "Footer",
+        fontName="Helvetica",
+        fontSize=8,
+        textColor=UF_GRAY,
+        alignment=TA_CENTER
+    )
+
+    story = []
+
+    # ── COVER PAGE ───────────────────────────────────────────────────
+    # Dark background cover using a table
+    cover_data = [[
+        Paragraph("Unicorn Factory<br/>Lisboa", style_cover_title),
+    ]]
+    cover_table = Table(cover_data, colWidths=[W])
+    cover_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), UF_BLACK),
+        ("TOPPADDING", (0, 0), (-1, -1), 40*mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10*mm),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12*mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12*mm),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [UF_BLACK]),
+    ]))
+    story.append(cover_table)
+
+    # Accent bar
+    accent_data = [[""]]
+    accent_table = Table(accent_data, colWidths=[W], rowHeights=[3*mm])
+    accent_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), UF_ACCENT),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    story.append(accent_table)
+
+    # Cover subtitle block
+    cover_info_data = [[
+        Paragraph(f"Portfolio Update", style_cover_sub),
+    ], [
+        Paragraph(f"{month_str}", style_cover_title),
+    ], [
+        Paragraph(f"Prepared {now.strftime('%d %B %Y')}  ·  Confidential", style_cover_date),
+    ]]
+    cover_info_table = Table(cover_info_data, colWidths=[W])
+    cover_info_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), UF_BLACK),
+        ("TOPPADDING", (0, 0), (0, 0), 6*mm),
+        ("TOPPADDING", (0, 1), (-1, -1), 1*mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -2), 1*mm),
+        ("BOTTOMPADDING", (0, -1), (-1, -1), 40*mm),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12*mm),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 12*mm),
+    ]))
+    story.append(cover_info_table)
+    story.append(PageBreak())
+
+    # ── PAGE 2 — EXECUTIVE SUMMARY ───────────────────────────────────
+    story.append(Paragraph("Executive Summary", style_section_header))
+    story.append(HRFlowable(width=W, thickness=1, color=UF_ACCENT, spaceAfter=4*mm))
+
+    # Aggregate stats band
+    stats_data = [[
+        Paragraph(f"€{total_mrr:,.0f}<br/><font size=8 color='#6B7280'>Combined MRR</font>", style_body),
+        Paragraph(f"{responded_count}/{total_companies}<br/><font size=8 color='#6B7280'>Companies Reported</font>", style_body),
+        Paragraph(f"{avg_runway:.1f} mo<br/><font size=8 color='#6B7280'>Avg. Runway</font>", style_body),
+        Paragraph(f"{total_headcount}<br/><font size=8 color='#6B7280'>Total Headcount</font>", style_body),
+    ]]
+    stats_table = Table(stats_data, colWidths=[W/4]*4)
+    stats_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), UF_LIGHT),
+        ("TOPPADDING", (0, 0), (-1, -1), 5*mm),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5*mm),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5*mm),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 14),
+        ("TEXTCOLOR", (0, 0), (-1, -1), UF_BLACK),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [UF_LIGHT]),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E5E7EB")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E5E7EB")),
+    ]))
+    story.append(stats_table)
+    story.append(Spacer(1, 5*mm))
+
+    # AI narrative
+    for para in narrative.split("\n\n"):
+        if para.strip():
+            story.append(Paragraph(para.strip(), style_body))
+
+    story.append(PageBreak())
+
+    # ── PAGE 3+ — STARTUP SNAPSHOTS ──────────────────────────────────
+    story.append(Paragraph("Portfolio Snapshots", style_section_header))
+    story.append(HRFlowable(width=W, thickness=1, color=UF_ACCENT, spaceAfter=4*mm))
+
+    for i, d in enumerate(portfolio_data):
+        status = d["status"]
+        if "🔴" in status:
+            status_color = UF_RED
+        elif "🟡" in status:
+            status_color = UF_YELLOW
+        else:
+            status_color = UF_GREEN
+
+        # Company header row
+        header_data = [[
+            Paragraph(d["company"], style_company_name),
+            Paragraph(status, ParagraphStyle(
+                "Status", fontName="Helvetica-Bold", fontSize=10,
+                textColor=status_color, alignment=TA_RIGHT
+            ))
+        ]]
+        header_table = Table(header_data, colWidths=[W*0.7, W*0.3])
+        header_table.setStyle(TableStyle([
+            ("TOPPADDING", (0, 0), (-1, -1), 3*mm),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 1*mm),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ]))
+        story.append(header_table)
+        story.append(Paragraph(f"Founder: {d['founder']}", style_small))
+
+        # Metrics row
+        metrics_data = [[
+            Paragraph(f"<b>€{d['mrr']:,.0f}</b><br/><font size=7 color='#6B7280'>MRR</font>", style_body),
+            Paragraph(f"<b>{d['runway']} mo</b><br/><font size=7 color='#6B7280'>Runway</font>", style_body),
+            Paragraph(f"<b>{d['headcount']}</b><br/><font size=7 color='#6B7280'>Headcount</font>", style_body),
+            Paragraph(
+                f"<b>{'↑' if not d['previous_mrr'] or d['mrr'] >= d['previous_mrr'] else '↓'} {abs(((d['mrr'] - d['previous_mrr']) / d['previous_mrr'] * 100)) if d['previous_mrr'] else 0:.0f}%</b><br/><font size=7 color='#6B7280'>MRR Change</font>",
+                ParagraphStyle(
+                    "MrrChange",
+                    fontName="Helvetica-Bold",
+                    fontSize=10,
+                    textColor=UF_GREEN if not d['previous_mrr'] or d['mrr'] >= d['previous_mrr'] else UF_RED,
+                    spaceAfter=2*mm
+                )
+            ),
+        ]]
+        metrics_table = Table(metrics_data, colWidths=[W/4]*4)
+        metrics_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), UF_LIGHT),
+            ("TOPPADDING", (0, 0), (-1, -1), 3*mm),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3*mm),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3*mm),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E5E7EB")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E5E7EB")),
+        ]))
+        story.append(metrics_table)
+        story.append(Spacer(1, 2*mm))
+
+        # Win / Blocker
+        wb_data = [[
+            Paragraph(f"<b>🏆 Biggest Win</b><br/>{d['biggest_win']}", style_body),
+            Paragraph(f"<b>🚧 Current Blocker</b><br/>{d['biggest_blocker']}", style_body),
+        ]]
+        wb_table = Table(wb_data, colWidths=[W/2, W/2])
+        wb_table.setStyle(TableStyle([
+            ("TOPPADDING", (0, 0), (-1, -1), 3*mm),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3*mm),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3*mm),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#E5E7EB")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#E5E7EB")),
+        ]))
+        story.append(wb_table)
+
+        # Help needed (only if flagged)
+        if d["help_needed"] and d["help_needed"].strip().lower() not in ["no", "não", "nao", "n/a", "-", ""]:
+            story.append(Spacer(1, 1*mm))
+            help_data = [[
+                Paragraph(f"<b>💬 Support Requested:</b> {d['help_needed']}", style_body)
+            ]]
+            help_table = Table(help_data, colWidths=[W])
+            help_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#FEF3C7")),
+                ("TOPPADDING", (0, 0), (-1, -1), 2*mm),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2*mm),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3*mm),
+                ("BOX", (0, 0), (-1, -1), 0.5, UF_YELLOW),
+            ]))
+            story.append(help_table)
+
+        story.append(Spacer(1, 5*mm))
+        story.append(HRFlowable(width=W, thickness=0.5, color=colors.HexColor("#E5E7EB"), spaceAfter=4*mm))
+
+    # ── LAST PAGE — PENDING + CLOSING ────────────────────────────────
+    if pending_companies:
+        story.append(PageBreak())
+        story.append(Paragraph("Awaiting Updates", style_section_header))
+        story.append(HRFlowable(width=W, thickness=1, color=UF_ACCENT, spaceAfter=3*mm))
+        story.append(Paragraph(
+            "The following portfolio companies have not yet submitted their monthly update. "
+            "Unicorn Factory Lisboa is actively following up.",
+            style_body
+        ))
+        for company in sorted(pending_companies):
+            story.append(Paragraph(f"• {company}", style_body))
+        story.append(Spacer(1, 6*mm))
+
+    # Closing note
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width=W, thickness=1, color=UF_ACCENT, spaceAfter=4*mm))
+    story.append(Paragraph(
+        f"Next update expected in {(now.replace(day=1) + timedelta(days=32)).replace(day=1).strftime('%B %Y')}. "
+        f"For questions, contact the Unicorn Factory Lisboa portfolio team.",
+        style_footer
+    ))
+    story.append(Paragraph(
+        "This document is confidential and intended solely for the named recipients.",
+        style_footer
+    ))
+
+    doc.build(story)
+    print(f"[DEBUG] PDF generated: {filepath}")
+    return filepath
+
+
+def fetch_portfolio_data_for_report():
+    """Pull this month's data from Notion and format it for the PDF."""
+    tz = pytz.timezone("Europe/Lisbon")
+    now = datetime.now(tz)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d")
+
+    pages = get_latest_entry_per_company(month_start)
+
+    portfolio_data = []
+    responded_companies = set()
+
+    for page in pages:
+        props = page["properties"]
+        company = props.get("Company", {}).get("title", [{}])[0].get("text", {}).get("content", "Unknown")
+        founder = props.get("Founder", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "Unknown")
+        mrr = props.get("MRR (€)", {}).get("number", 0) or 0
+        previous_mrr = props.get("Previous MRR (€)", {}).get("number", 0) or 0
+        runway = props.get("Runway (months)", {}).get("number", 0) or 0
+        headcount = props.get("Headcount", {}).get("number", 0) or 0
+        biggest_win = props.get("Biggest Win", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "—")
+        biggest_blocker = props.get("Biggest Blocker", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "—")
+        help_needed = props.get("Help Needed", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "")
+
+        status = get_status_indicator(runway, mrr, previous_mrr, help_needed)
+
+        responded_companies.add(company)
+        portfolio_data.append({
+            "company": company,
+            "founder": founder,
+            "mrr": mrr,
+            "previous_mrr": previous_mrr,
+            "runway": runway,
+            "headcount": headcount,
+            "biggest_win": biggest_win,
+            "biggest_blocker": biggest_blocker,
+            "help_needed": help_needed,
+            "status": status
+        })
+
+    all_companies = set(startups["startup_name"].tolist())
+    pending_companies = sorted(all_companies - responded_companies)
+
+    return portfolio_data, pending_companies
+
+
+def generate_and_send_report(user_id):
+    """Generate the PDF and send it to the admin via Slack with an approve button."""
+    tz = pytz.timezone("Europe/Lisbon")
+    now = datetime.now(tz)
+    month_str = now.strftime("%B %Y")
+
+    try:
+        bot_client.chat_postMessage(
+            channel=user_id,
+            text=f"⏳ Generating investor update for *{month_str}*... this takes about 30 seconds."
+        )
+    except Exception as e:
+        print(f"[ERROR] Could not notify admin: {e}")
+
+    portfolio_data, pending_companies = fetch_portfolio_data_for_report()
+
+    if not portfolio_data:
+        try:
+            bot_client.chat_postMessage(
+                channel=user_id,
+                text="⚠️ No health check data found for this month. Ask founders to fill the form first."
+            )
+        except Exception as e:
+            print(f"[ERROR] {e}")
+        return
+
+    filepath = build_pdf_report(month_str, portfolio_data, pending_companies)
+
+    # Upload PDF to Slack
+    try:
+        with open(filepath, "rb") as f:
+            bot_client.files_upload_v2(
+                channel=user_id,
+                file=f,
+                filename=os.path.basename(filepath),
+                initial_comment=(
+                    f"📊 *Investor Update — {month_str}* is ready for your review.\n\n"
+                    f"*{len(portfolio_data)}/{len(startups)} companies* reported this month. "
+                    f"{'*⚠️ ' + str(len(pending_companies)) + ' companies pending.*' if pending_companies else '✅ All companies reported.'}\n\n"
+                    f"Review the PDF above, then forward it to your investors when ready."
+                )
+            )
+        print(f"[DEBUG] PDF sent to admin via Slack.")
+    except Exception as e:
+        print(f"[ERROR] Failed to upload PDF to Slack: {e}")
+
+
+# =========================
+# MONTHLY INVESTOR UPDATE SCHEDULER
+# =========================
+
+def schedule_monthly_investor_update():
+    """Auto-generate investor update on the 10th of every month at 09:00 Lisbon time."""
+    tz = pytz.timezone("Europe/Lisbon")
+
+    def next_run_time():
+        now = datetime.now(tz)
+        if now.day == 10 and now.hour < 9:
+            target = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        else:
+            if now.month == 12:
+                target = now.replace(year=now.year + 1, month=1, day=10, hour=9, minute=0, second=0, microsecond=0)
+            else:
+                target = now.replace(month=now.month + 1, day=10, hour=9, minute=0, second=0, microsecond=0)
+        return target
+
+    def run():
+        while True:
+            target = next_run_time()
+            now = datetime.now(tz)
+            delay = (target - now).total_seconds()
+            print(f"[CRON] Next investor update scheduled for {target.strftime('%d %b %Y at %H:%M %Z')} (in {delay:.0f}s)")
+            time.sleep(delay)
+            generate_and_send_report(ADMIN_USER_ID)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+# =========================
 # TYPEFORM WEBHOOK
 # =========================
 
 def parse_typeform_response(payload):
-    """Extract answers from a Typeform webhook payload."""
     answers = payload.get("form_response", {}).get("answers", [])
     definition = payload.get("form_response", {}).get("definition", {})
     fields = {f["id"]: f["title"] for f in definition.get("fields", [])}
@@ -423,7 +890,6 @@ def parse_typeform_response(payload):
         elif "help" in field_title or "unicorn" in field_title:
             data["help_needed"] = value or ""
 
-    # AI-powered company matching
     raw_company = data.get("company", "")
     matched_company = match_company_with_ai(raw_company) if raw_company else None
 
@@ -444,7 +910,6 @@ def parse_typeform_response(payload):
 def typeform_webhook():
     secret = request.args.get("secret", "")
     if secret != TYPEFORM_WEBHOOK_SECRET:
-        print("[WARN] Unauthorized webhook attempt")
         return jsonify({"error": "Unauthorized"}), 401
 
     payload = request.json
@@ -455,7 +920,6 @@ def typeform_webhook():
     print(f"[DEBUG] Parsed Typeform response: {data}")
 
     alert, alert_reasons = write_to_notion(data)
-
     if alert:
         send_alert(data.get("company", "Unknown"), data.get("founder", "Unknown"), alert_reasons)
 
@@ -466,7 +930,6 @@ def typeform_webhook():
 # =========================
 
 def send_health_check_pings(user_id):
-    """DM every founder in the CSV with the health check Typeform link."""
     if user_id != ADMIN_USER_ID:
         return
 
@@ -502,7 +965,6 @@ def send_health_check_pings(user_id):
 # =========================
 
 def schedule_monthly_health_check():
-    """Schedule the health check ping for the 1st of every month at 09:00 Lisbon time."""
     tz = pytz.timezone("Europe/Lisbon")
 
     def next_run_time():
@@ -511,15 +973,9 @@ def schedule_monthly_health_check():
             target = now.replace(hour=9, minute=0, second=0, microsecond=0)
         else:
             if now.month == 12:
-                target = now.replace(
-                    year=now.year + 1, month=1, day=1,
-                    hour=9, minute=0, second=0, microsecond=0
-                )
+                target = now.replace(year=now.year + 1, month=1, day=1, hour=9, minute=0, second=0, microsecond=0)
             else:
-                target = now.replace(
-                    month=now.month + 1, day=1,
-                    hour=9, minute=0, second=0, microsecond=0
-                )
+                target = now.replace(month=now.month + 1, day=1, hour=9, minute=0, second=0, microsecond=0)
         return target
 
     def run():
@@ -539,12 +995,9 @@ def schedule_monthly_health_check():
 # =========================
 
 def send_weekly_digest():
-    """Query Notion for this month's responses and post a digest to Slack."""
     tz = pytz.timezone("Europe/Lisbon")
     now = datetime.now(tz)
-    month_start = now.replace(
-        day=1, hour=0, minute=0, second=0, microsecond=0
-    ).strftime("%Y-%m-%d")
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d")
 
     pages = get_latest_entry_per_company(month_start)
 
@@ -564,32 +1017,15 @@ def send_weekly_digest():
 
     for page in pages:
         props = page["properties"]
-        company = (
-            props.get("Company", {})
-            .get("title", [{}])[0]
-            .get("text", {})
-            .get("content", "Unknown")
-        )
-        founder = (
-            props.get("Founder", {})
-            .get("rich_text", [{}])[0]
-            .get("text", {})
-            .get("content", "Unknown")
-        )
+        company = props.get("Company", {}).get("title", [{}])[0].get("text", {}).get("content", "Unknown")
+        founder = props.get("Founder", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "Unknown")
         mrr = props.get("MRR (€)", {}).get("number", 0) or 0
         runway = props.get("Runway (months)", {}).get("number", 0) or 0
         alert = props.get("Alert", {}).get("checkbox", False)
-        alert_reason = (
-            props.get("Alert Reason", {})
-            .get("rich_text", [{}])[0]
-            .get("text", {})
-            .get("content", "")
-        )
+        alert_reason = props.get("Alert Reason", {}).get("rich_text", [{}])[0].get("text", {}).get("content", "")
 
         responded_companies.add(company)
-        responded.append(
-            f"• *{company}* ({founder}) — MRR: €{mrr:,.0f} | Runway: {runway}mo"
-        )
+        responded.append(f"• *{company}* ({founder}) — MRR: €{mrr:,.0f} | Runway: {runway}mo")
         if alert:
             alerts.append(f"• 🚨 *{company}* — {alert_reason}")
 
@@ -601,13 +1037,10 @@ def send_weekly_digest():
 
     digest = f"📋 *Weekly Portfolio Digest — {now.strftime('%B %Y')}*\n\n"
     digest += f"*{responded_count}/{total_startups} founders have responded* ({missing_count} still pending)\n\n"
-
     if responded:
         digest += "*Responses this month:*\n" + "\n".join(responded) + "\n\n"
-
     if alerts:
         digest += "*⚠️ Active alerts:*\n" + "\n".join(alerts) + "\n\n"
-
     if pending_companies:
         pending_list = "\n".join([f"• {c}" for c in sorted(pending_companies)])
         digest += f"*Still waiting on:*\n{pending_list}\n\n"
@@ -621,15 +1054,12 @@ def send_weekly_digest():
 
 
 def schedule_weekly_digest():
-    """Schedule the weekly digest every Monday at 08:00 Lisbon time."""
     tz = pytz.timezone("Europe/Lisbon")
 
     def next_monday():
         now = datetime.now(tz)
         days_until_monday = (7 - now.weekday()) % 7 or 7
-        target = (now + timedelta(days=days_until_monday)).replace(
-            hour=8, minute=0, second=0, microsecond=0
-        )
+        target = (now + timedelta(days=days_until_monday)).replace(hour=8, minute=0, second=0, microsecond=0)
         return target
 
     def run():
@@ -650,7 +1080,6 @@ def schedule_weekly_digest():
 
 def process_messages(user_id, client_type="user", selected_ids=None, message_template=None):
     if user_id != ADMIN_USER_ID:
-        print(f"User {user_id} is not allowed to send messages.")
         return
 
     total_sent = 0
@@ -662,15 +1091,12 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
         slack_id = str(row.get("slack_user_id", ""))
         if not slack_id or slack_id == "nan":
             continue
-
         if selected_ids is not None and slack_id not in selected_ids:
             continue
-
         message = template.format(
             founder_name=row.get("founder_name", "Founder"),
             startup_name=row.get("startup_name", "Startup")
         )
-
         try:
             client.chat_postMessage(channel=slack_id, text=message)
             total_sent += 1
@@ -682,10 +1108,7 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
     admin_session["scheduled_timer"] = None
 
     try:
-        client.chat_postMessage(
-            channel=user_id,
-            text=f"Done! Sent {total_sent} messages as {source}."
-        )
+        client.chat_postMessage(channel=user_id, text=f"Done! Sent {total_sent} messages as {source}.")
     except Exception as e:
         print(f"Could not notify admin: {e}")
 
@@ -697,19 +1120,12 @@ def process_messages(user_id, client_type="user", selected_ids=None, message_tem
 
 def schedule_messages(user_id, scheduled_dt_utc, client_type="bot", selected_ids=None, message_template=None):
     cancel_scheduled_send(notify=False)
-
     delay_seconds = (scheduled_dt_utc - datetime.now(pytz.utc)).total_seconds()
     if delay_seconds < 0:
         delay_seconds = 0
-
-    timer = threading.Timer(
-        delay_seconds,
-        process_messages,
-        args=(user_id, client_type, selected_ids, message_template)
-    )
+    timer = threading.Timer(delay_seconds, process_messages, args=(user_id, client_type, selected_ids, message_template))
     timer.daemon = True
     timer.start()
-
     admin_session["scheduled_time"] = scheduled_dt_utc
     admin_session["scheduled_timer"] = timer
 
@@ -720,13 +1136,9 @@ def cancel_scheduled_send(notify=True):
         timer.cancel()
     admin_session["scheduled_timer"] = None
     admin_session["scheduled_time"] = None
-
     if notify:
         try:
-            bot_client.chat_postMessage(
-                channel=ADMIN_USER_ID,
-                text="⏹️ Scheduled send cancelled."
-            )
+            bot_client.chat_postMessage(channel=ADMIN_USER_ID, text="⏹️ Scheduled send cancelled.")
         except Exception as e:
             print(f"Could not notify admin of cancellation: {e}")
 
@@ -745,49 +1157,37 @@ def home():
 @app.route("/sendmessages", methods=["POST"])
 def send_messages():
     user_id = request.form.get("user_id")
-
     if user_id != ADMIN_USER_ID:
         return jsonify({"response_type": "ephemeral", "text": "You are not allowed to use this command."}), 200
-
-    threading.Thread(
-        target=process_messages,
-        args=(user_id, "user", admin_session["selected_startup_ids"], admin_session["message_template"])
-    ).start()
-
-    return jsonify({
-        "response_type": "ephemeral",
-        "text": "Blasting messages now. Check your DMs for a confirmation when it's done."
-    }), 200
+    threading.Thread(target=process_messages, args=(user_id, "user", admin_session["selected_startup_ids"], admin_session["message_template"])).start()
+    return jsonify({"response_type": "ephemeral", "text": "Blasting messages now. Check your DMs for a confirmation when it's done."}), 200
 
 
 @app.route("/healthcheck", methods=["POST"])
 def trigger_health_check_slash():
     user_id = request.form.get("user_id")
-
     if user_id != ADMIN_USER_ID:
         return jsonify({"response_type": "ephemeral", "text": "You are not allowed to use this command."}), 200
-
     threading.Thread(target=send_health_check_pings, args=(user_id,)).start()
-
-    return jsonify({
-        "response_type": "ephemeral",
-        "text": "Sending health check pings now. You'll get a DM when it's done."
-    }), 200
+    return jsonify({"response_type": "ephemeral", "text": "Sending health check pings now. You'll get a DM when it's done."}), 200
 
 
 @app.route("/digest", methods=["POST"])
 def trigger_digest_slash():
     user_id = request.form.get("user_id")
-
     if user_id != ADMIN_USER_ID:
         return jsonify({"response_type": "ephemeral", "text": "You are not allowed to use this command."}), 200
-
     threading.Thread(target=send_weekly_digest).start()
+    return jsonify({"response_type": "ephemeral", "text": "Generating digest now. Check your Slack channel in a moment."}), 200
 
-    return jsonify({
-        "response_type": "ephemeral",
-        "text": "Generating digest now. Check your Slack channel in a moment."
-    }), 200
+
+@app.route("/investorupdate", methods=["POST"])
+def trigger_investor_update_slash():
+    user_id = request.form.get("user_id")
+    if user_id != ADMIN_USER_ID:
+        return jsonify({"response_type": "ephemeral", "text": "You are not allowed to use this command."}), 200
+    threading.Thread(target=generate_and_send_report, args=(user_id,)).start()
+    return jsonify({"response_type": "ephemeral", "text": "⏳ Generating investor update PDF... you'll receive it as a DM in about 30 seconds."}), 200
 
 # =========================
 # HOME TAB VIEWS
@@ -812,10 +1212,7 @@ def build_admin_home_view():
     for _, row in startups.iterrows():
         slack_id = str(row.get("slack_user_id", ""))
         label = f"{row.get('founder_name', '?')}  —  {row.get('startup_name', '?')}"
-        option = {
-            "text": {"type": "plain_text", "text": label[:75], "emoji": False},
-            "value": slack_id
-        }
+        option = {"text": {"type": "plain_text", "text": label[:75], "emoji": False}, "value": slack_id}
         startup_options.append(option)
         if selected_ids is None or slack_id in selected_ids:
             initial_options.append(option)
@@ -825,13 +1222,7 @@ def build_admin_home_view():
         scheduled_status_blocks = [
             {
                 "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"⏰ *Scheduled send active* — "
-                        f"Messages will go out on *{format_scheduled_time_local(scheduled_time)}*."
-                    )
-                },
+                "text": {"type": "mrkdwn", "text": f"⏰ *Scheduled send active* — Messages will go out on *{format_scheduled_time_local(scheduled_time)}*."},
                 "accessory": {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Cancel schedule", "emoji": False},
@@ -855,94 +1246,74 @@ def build_admin_home_view():
             {"type": "section", "text": {"type": "mrkdwn", "text": "Outreach that hits different. Select your founders, craft your message, blast it out."}},
             {"type": "divider"},
             *scheduled_status_blocks,
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*{startup_count}*\nFounders in the roster"},
-                    {"type": "mrkdwn", "text": f"*{selected_count}*\nSelected to receive"},
-                    {"type": "mrkdwn", "text": f"*{skipped_count}*\nSkipped this round"},
-                    {"type": "mrkdwn", "text": "*Admin*\nFull access"}
-                ]
-            },
+            {"type": "section", "fields": [
+                {"type": "mrkdwn", "text": f"*{startup_count}*\nFounders in the roster"},
+                {"type": "mrkdwn", "text": f"*{selected_count}*\nSelected to receive"},
+                {"type": "mrkdwn", "text": f"*{skipped_count}*\nSkipped this round"},
+                {"type": "mrkdwn", "text": "*Admin*\nFull access"}
+            ]},
             {"type": "divider"},
             {"type": "header", "text": {"type": "plain_text", "text": "Who's getting this?", "emoji": False}},
             {"type": "section", "text": {"type": "mrkdwn", "text": "Uncheck anyone you want to skip. Everyone else gets the message."}},
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "checkboxes",
-                        "action_id": "startup_selector",
-                        "options": startup_options,
-                        "initial_options": initial_options
-                    }
-                ]
-            },
+            {"type": "actions", "elements": [{"type": "checkboxes", "action_id": "startup_selector", "options": startup_options, "initial_options": initial_options}]},
             {"type": "divider"},
             {"type": "header", "text": {"type": "plain_text", "text": "The message", "emoji": False}},
             {
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": f"_{current_template}_"},
-                "accessory": {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Edit", "emoji": False},
-                    "action_id": "open_message_editor",
-                    "style": "primary"
-                }
+                "accessory": {"type": "button", "text": {"type": "plain_text", "text": "Edit", "emoji": False}, "action_id": "open_message_editor", "style": "primary"}
             },
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": "Live preview  —  " + current_template.format(founder_name="Maria", startup_name="Acme")}]
-            },
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Live preview  —  " + current_template.format(founder_name="Maria", startup_name="Acme")}]},
             {"type": "divider"},
             {"type": "header", "text": {"type": "plain_text", "text": "Ready to launch?", "emoji": False}},
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"You're about to reach *{selected_count} founder(s)*. You'll get a DM the moment it's done."}
-            },
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Send Now", "emoji": False},
-                        "style": "primary",
-                        "action_id": "send_messages_button",
-                        "confirm": {
-                            "title": {"type": "plain_text", "text": "Launch outreach?"},
-                            "text": {"type": "mrkdwn", "text": f"This sends your message to *{selected_count} founder(s)* right now. No take-backs."},
-                            "confirm": {"type": "plain_text", "text": "Let's go"},
-                            "deny": {"type": "plain_text", "text": "Not yet"}
-                        }
-                    },
-                    {"type": "button", "text": {"type": "plain_text", "text": "Schedule Send", "emoji": False}, "action_id": "open_schedule_modal"},
-                    {"type": "button", "text": {"type": "plain_text", "text": "Reset everything", "emoji": False}, "action_id": "reset_defaults_button"}
-                ]
-            },
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"You're about to reach *{selected_count} founder(s)*. You'll get a DM the moment it's done."}},
+            {"type": "actions", "elements": [
+                {
+                    "type": "button", "text": {"type": "plain_text", "text": "Send Now", "emoji": False},
+                    "style": "primary", "action_id": "send_messages_button",
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Launch outreach?"},
+                        "text": {"type": "mrkdwn", "text": f"This sends your message to *{selected_count} founder(s)* right now."},
+                        "confirm": {"type": "plain_text", "text": "Let's go"},
+                        "deny": {"type": "plain_text", "text": "Not yet"}
+                    }
+                },
+                {"type": "button", "text": {"type": "plain_text", "text": "Schedule Send", "emoji": False}, "action_id": "open_schedule_modal"},
+                {"type": "button", "text": {"type": "plain_text", "text": "Reset everything", "emoji": False}, "action_id": "reset_defaults_button"}
+            ]},
             {"type": "divider"},
             {"type": "header", "text": {"type": "plain_text", "text": "Portfolio Health Checks", "emoji": False}},
             {"type": "section", "text": {"type": "mrkdwn", "text": "Ping all founders with the monthly health check form, or generate the portfolio digest on demand."}},
-            {
-                "type": "actions",
-                "elements": [
-                    {
-                        "type": "button",
-                        "text": {"type": "plain_text", "text": "Send Health Check Pings", "emoji": False},
-                        "action_id": "send_health_check_button",
-                        "confirm": {
-                            "title": {"type": "plain_text", "text": "Send health check pings?"},
-                            "text": {"type": "mrkdwn", "text": "This will DM every founder in your roster with the monthly health check form link."},
-                            "confirm": {"type": "plain_text", "text": "Send it"},
-                            "deny": {"type": "plain_text", "text": "Not yet"}
-                        }
-                    },
-                    {"type": "button", "text": {"type": "plain_text", "text": "Generate Digest", "emoji": False}, "action_id": "send_digest_button"}
-                ]
-            },
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": "Health checks go out automatically on the 1st of each month. Digest posts every Monday at 08:00. Use `/healthcheck` or `/digest` from any channel too."}]
-            }
+            {"type": "actions", "elements": [
+                {
+                    "type": "button", "text": {"type": "plain_text", "text": "Send Health Check Pings", "emoji": False},
+                    "action_id": "send_health_check_button",
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Send health check pings?"},
+                        "text": {"type": "mrkdwn", "text": "This will DM every founder in your roster with the monthly health check form link."},
+                        "confirm": {"type": "plain_text", "text": "Send it"},
+                        "deny": {"type": "plain_text", "text": "Not yet"}
+                    }
+                },
+                {"type": "button", "text": {"type": "plain_text", "text": "Generate Digest", "emoji": False}, "action_id": "send_digest_button"}
+            ]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Health checks go out automatically on the 1st of each month. Digest posts every Monday at 08:00."}]},
+            {"type": "divider"},
+            {"type": "header", "text": {"type": "plain_text", "text": "Investor Update", "emoji": False}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "Generate a professional PDF investor update from this month's health check data. Auto-runs on the 10th of each month."}},
+            {"type": "actions", "elements": [
+                {
+                    "type": "button", "text": {"type": "plain_text", "text": "Generate Investor Update PDF", "emoji": False},
+                    "style": "primary", "action_id": "generate_investor_update_button",
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Generate investor update?"},
+                        "text": {"type": "mrkdwn", "text": "This will generate a PDF report from this month's data and send it to you as a DM for review."},
+                        "confirm": {"type": "plain_text", "text": "Generate it"},
+                        "deny": {"type": "plain_text", "text": "Not yet"}
+                    }
+                }
+            ]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": "Use `/investorupdate` from any channel too. You'll receive the PDF as a DM for review before forwarding."}]}
         ]
     }
 
@@ -955,22 +1326,13 @@ def build_message_editor_modal():
         "submit": {"type": "plain_text", "text": "Save", "emoji": False},
         "close": {"type": "plain_text", "text": "Cancel", "emoji": False},
         "blocks": [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": "*Make it yours.*\nUse `{founder_name}` and `{startup_name}` as dynamic placeholders."
-                }
-            },
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*Make it yours.*\nUse `{founder_name}` and `{startup_name}` as dynamic placeholders."}},
             {"type": "divider"},
             {
-                "type": "input",
-                "block_id": "message_editor_block",
+                "type": "input", "block_id": "message_editor_block",
                 "element": {
-                    "type": "plain_text_input",
-                    "action_id": "message_editor",
-                    "multiline": True,
-                    "initial_value": admin_session["message_template"],
+                    "type": "plain_text_input", "action_id": "message_editor",
+                    "multiline": True, "initial_value": admin_session["message_template"],
                     "placeholder": {"type": "plain_text", "text": "Write something worth reading..."}
                 },
                 "label": {"type": "plain_text", "text": "Message body", "emoji": False},
@@ -984,50 +1346,17 @@ def build_schedule_modal():
     tz_label = admin_session.get("timezone", "Europe/Lisbon")
     tz = pytz.timezone(tz_label)
     tomorrow_local = (datetime.now(tz) + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-
     return {
-        "type": "modal",
-        "callback_id": "schedule_modal",
+        "type": "modal", "callback_id": "schedule_modal",
         "title": {"type": "plain_text", "text": "Schedule send", "emoji": False},
         "submit": {"type": "plain_text", "text": "Schedule", "emoji": False},
         "close": {"type": "plain_text", "text": "Cancel", "emoji": False},
         "blocks": [
             {"type": "section", "text": {"type": "mrkdwn", "text": f"*Pick a date and time* ({tz_label})."}},
             {"type": "divider"},
-            {
-                "type": "input",
-                "block_id": "schedule_date_block",
-                "element": {
-                    "type": "datepicker",
-                    "action_id": "schedule_date",
-                    "initial_date": tomorrow_local.strftime("%Y-%m-%d"),
-                    "placeholder": {"type": "plain_text", "text": "Select a date"}
-                },
-                "label": {"type": "plain_text", "text": "Date", "emoji": False}
-            },
-            {
-                "type": "input",
-                "block_id": "schedule_time_block",
-                "element": {
-                    "type": "timepicker",
-                    "action_id": "schedule_time",
-                    "initial_time": tomorrow_local.strftime("%H:%M"),
-                    "placeholder": {"type": "plain_text", "text": "Select a time"}
-                },
-                "label": {"type": "plain_text", "text": "Time", "emoji": False}
-            },
-            {
-                "type": "input",
-                "block_id": "schedule_tz_block",
-                "element": {
-                    "type": "plain_text_input",
-                    "action_id": "schedule_tz",
-                    "initial_value": tz_label,
-                    "placeholder": {"type": "plain_text", "text": "e.g. Europe/Lisbon"}
-                },
-                "label": {"type": "plain_text", "text": "Timezone (IANA format)", "emoji": False},
-                "hint": {"type": "plain_text", "text": "Your last used timezone is pre-filled.", "emoji": False}
-            }
+            {"type": "input", "block_id": "schedule_date_block", "element": {"type": "datepicker", "action_id": "schedule_date", "initial_date": tomorrow_local.strftime("%Y-%m-%d"), "placeholder": {"type": "plain_text", "text": "Select a date"}}, "label": {"type": "plain_text", "text": "Date", "emoji": False}},
+            {"type": "input", "block_id": "schedule_time_block", "element": {"type": "timepicker", "action_id": "schedule_time", "initial_time": tomorrow_local.strftime("%H:%M"), "placeholder": {"type": "plain_text", "text": "Select a time"}}, "label": {"type": "plain_text", "text": "Time", "emoji": False}},
+            {"type": "input", "block_id": "schedule_tz_block", "element": {"type": "plain_text_input", "action_id": "schedule_tz", "initial_value": tz_label, "placeholder": {"type": "plain_text", "text": "e.g. Europe/Lisbon"}}, "label": {"type": "plain_text", "text": "Timezone (IANA format)", "emoji": False}, "hint": {"type": "plain_text", "text": "Your last used timezone is pre-filled.", "emoji": False}}
         ]
     }
 
@@ -1039,7 +1368,7 @@ def build_guest_home_view():
             {"type": "header", "text": {"type": "plain_text", "text": "UnicornFactory", "emoji": False}},
             {"type": "section", "text": {"type": "mrkdwn", "text": "Outreach that hits different."}},
             {"type": "divider"},
-            {"type": "section", "text": {"type": "mrkdwn", "text": "*This area is admin-only.*\nYou don't have access to the outreach dashboard. If you think that's a mistake, ping your admin."}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "*This area is admin-only.*\nYou don't have access to the outreach dashboard."}},
             {"type": "context", "elements": [{"type": "mrkdwn", "text": "UnicornFactory Outreach Bot  ·  Admin access required"}]}
         ]
     }
@@ -1051,10 +1380,8 @@ def build_guest_home_view():
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     data = request.json
-
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
-
     if data.get("event", {}).get("type") == "app_home_opened":
         user_id = data["event"]["user"]
         try:
@@ -1062,7 +1389,6 @@ def slack_events():
             bot_client.views_publish(user_id=user_id, view=view)
         except Exception as e:
             print(f"Failed to publish Home tab: {e}")
-
     return "", 200
 
 # =========================
@@ -1113,17 +1439,10 @@ def slack_interactions():
                 return jsonify({"response_action": "errors", "errors": {"schedule_date_block": "The scheduled time must be in the future."}}), 200
 
             admin_session["timezone"] = tz_str
-            schedule_messages(
-                user_id=user_id, scheduled_dt_utc=utc_dt, client_type="bot",
-                selected_ids=admin_session["selected_startup_ids"],
-                message_template=admin_session["message_template"]
-            )
+            schedule_messages(user_id=user_id, scheduled_dt_utc=utc_dt, client_type="bot", selected_ids=admin_session["selected_startup_ids"], message_template=admin_session["message_template"])
 
             try:
-                bot_client.chat_postMessage(
-                    channel=user_id,
-                    text=f"✅ Scheduled! Your message goes out on *{format_scheduled_time_local(utc_dt)}*."
-                )
+                bot_client.chat_postMessage(channel=user_id, text=f"✅ Scheduled! Your message goes out on *{format_scheduled_time_local(utc_dt)}*.")
             except Exception as e:
                 print(f"Could not send schedule confirmation: {e}")
 
@@ -1153,14 +1472,9 @@ def slack_interactions():
 
         if action_id == "startup_selector":
             selected = actions[0].get("selected_options", [])
-            admin_session["selected_startup_ids"] = (
-                {opt["value"] for opt in selected} if selected else set()
-            )
+            admin_session["selected_startup_ids"] = ({opt["value"] for opt in selected} if selected else set())
         elif action_id == "send_messages_button":
-            threading.Thread(
-                target=process_messages,
-                args=(user_id, "bot", admin_session["selected_startup_ids"], admin_session["message_template"])
-            ).start()
+            threading.Thread(target=process_messages, args=(user_id, "bot", admin_session["selected_startup_ids"], admin_session["message_template"])).start()
         elif action_id == "cancel_schedule_button":
             cancel_scheduled_send(notify=True)
         elif action_id == "reset_defaults_button":
@@ -1171,6 +1485,8 @@ def slack_interactions():
             threading.Thread(target=send_health_check_pings, args=(user_id,)).start()
         elif action_id == "send_digest_button":
             threading.Thread(target=send_weekly_digest).start()
+        elif action_id == "generate_investor_update_button":
+            threading.Thread(target=generate_and_send_report, args=(user_id,)).start()
 
         try:
             bot_client.views_publish(user_id=user_id, view=build_admin_home_view())
@@ -1194,5 +1510,6 @@ def startup_count_for_session():
 if __name__ == "__main__":
     schedule_monthly_health_check()
     schedule_weekly_digest()
+    schedule_monthly_investor_update()
     port = int(os.environ.get("PORT", 3000))
     app.run(host="0.0.0.0", port=port)
