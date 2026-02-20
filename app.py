@@ -806,9 +806,13 @@ def generate_and_send_report(user_id):
 
     # Upload PDF to Slack
     try:
+        # Open a DM channel with the admin first to get a valid channel ID
+        dm = bot_client.conversations_open(users=user_id)
+        dm_channel_id = dm["channel"]["id"]
+
         with open(filepath, "rb") as f:
             bot_client.files_upload_v2(
-                channel=user_id,
+                channel=dm_channel_id,
                 file=f,
                 filename=os.path.basename(filepath),
                 initial_comment=(
